@@ -2,7 +2,7 @@
 Kernels for layernorm forward pass.
 
 Compile example:
-dpcpp -O3 -fsycl layernorm_forward.cpp -o layernorm_forward
+icpx -O3 -fsycl layernorm_forward.cpp -o layernorm_forward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./layernorm_forward 1
