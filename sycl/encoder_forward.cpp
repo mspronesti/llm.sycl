@@ -22,24 +22,11 @@ version 3 is like version 2 but uses float reads/writes
 #include <chrono>
 
 #define ENABLE_BF16
+#include "common.hpp"
+
 
 // ----------------------------------------------------------------------------
 // CPU code reference
-int* make_random_int(size_t N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
-    for (size_t i = 0; i < N; i++) {
-        arr[i] = rand() % V; // range 0..V-1
-    }
-    return arr;
-}
-
-float* make_random_float(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    return data;
-}
 
 // GPT-2 positional encoder forward pass
 void encoder_forward_cpu(float* out,
@@ -168,28 +155,6 @@ void encoder_forward(sycl::queue &q, int kernel_num,
     }
 }
 
-// ----------------------------------------------------------------------------
-
-void validate_results(float* ref, float* res, int size) {
-    for (int i = 0; i < size; ++i) {
-        if (std::fabs(ref[i] - res[i]) > 1e-5) {
-            std::cerr << "Result mismatch at index " << i << ": " << ref[i] << " != " << res[i] << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << "Validation passed!" << std::endl;
-}
-
-// Function to benchmark kernel execution time
-template <typename F>
-double benchmark_kernel(F&& f) {
-    auto start = std::chrono::high_resolution_clock::now();
-    f();
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end - start;
-    return diff.count();
-}
-
 int main(int argc, char **argv) {
     int B = 8;
     int T = 1024;
@@ -237,17 +202,18 @@ int main(int argc, char **argv) {
 #if defined(ENABLE_BF16) || defined(ENABLE_FP16)
         tol = 1e-2f;
 #endif
-	    validate_results(out, out, B * T * C);
-
+	    validate_result(out, out, "out", B * T * C, tol);
     }
 
     std::cout << "All results match. Starting benchmarks." << std::endl;
 
     for (int block_size : block_sizes) {
         int repeat_times = 1000;
-        double elapsed_time = benchmark_kernel([&] {
-       	   encoder_forward(q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C);
-    	});
+        double elapsed_time = benchmark_kernel(
+            repeat_times,
+       	   encoder_forward, // kernel
+          q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C // params
+    	);
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 3 reads and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s

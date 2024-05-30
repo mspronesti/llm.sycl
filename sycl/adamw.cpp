@@ -1,36 +1,10 @@
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
-
-// Helper functions for creating random data
-float* make_random_float(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    return data;
-}
-
-float* make_random_float_01(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / (RAND_MAX + 1.0);
-    }
-    return data;
-}
-
-void validate_result(float* result, float* reference, const char* name, long num_elements) {
-    for (long i = 0; i < num_elements; i++) {
-        if (std::fabs(result[i] - reference[i]) > 1e-5) {
-            std::cerr << "Validation failed for " << name << " at index " << i << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << name << " validation passed." << std::endl;
-}
+#include "common.hpp"
 
 void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
                float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {

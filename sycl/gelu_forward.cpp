@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
-
+#include "common.hpp"
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 
 // ----------------------------------------------------------------------------
@@ -86,44 +86,7 @@ void gelu_forward(int kernel_num, sycl::queue& q, float* out, const float* inp, 
 }
 
 // ----------------------------------------------------------------------------
-// Utility functions
-
-float* make_random_float(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    return data;
-}
-
-void validate_result(float* result, float* reference, const char* name, long num_elements, float tol) {
-    for (long i = 0; i < num_elements; i++) {
-        if (std::fabs(result[i] - reference[i]) > tol) {
-            std::cerr << "Validation failed for " << name << " at index " << i << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << name << " validation passed." << std::endl;
-}
-
-float benchmark_kernel(int repeat_times, void (*kernel)(int, sycl::queue&, float*, const float*, int, const int), int kernel_num, sycl::queue& q, float* out, const float* inp, int N, const int block_size) {
-    float elapsed_time = 0.0f;
-
-    for (int i = 0; i < repeat_times; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        kernel(kernel_num, q, out, inp, N, block_size);
-        q.wait();
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float, std::milli> duration = end - start;
-        elapsed_time += duration.count();
-    }
-
-    return elapsed_time / repeat_times;
-}
-
-// ----------------------------------------------------------------------------
 // Main function
-
 int main(int argc, char** argv) {
     int B = 8;
     int T = 1024;
@@ -159,7 +122,11 @@ int main(int argc, char** argv) {
 
     for (int block_size : block_sizes) {
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(repeat_times, gelu_forward, kernel_num, q, out, inp, N, block_size);
+        float elapsed_time = benchmark_kernel(
+            repeat_times,
+            gelu_forward, // kernel
+            kernel_num, q, out, inp, N, block_size // kernel params
+        );
 
         // Napkin math: estimate the memory bandwidth achieved
         long memory_ops = N * 2 * sizeof(float);

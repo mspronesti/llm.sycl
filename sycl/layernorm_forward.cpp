@@ -28,33 +28,8 @@ version 5 allocates blocks per row instead of warps per row, same alg as 4 other
 #include <cassert>
 #include <chrono>
 
-// Function to generate random floats
-void make_random_float(float* ptr, int size) {
-    for (int i = 0; i < size; ++i) {
-        ptr[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-    }
-}
+#include "common.hpp"
 
-// Function to validate results between reference and computed arrays
-void validate_results(float* ref, float* res, int size) {
-    for (int i = 0; i < size; ++i) {
-        if (fabs(ref[i] - res[i]) > 1e-5) {
-            std::cerr << "Result mismatch at index " << i << ": " << ref[i] << " != " << res[i] << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << "Validation passed!" << std::endl;
-}
-
-// Function to benchmark kernel execution time
-template <typename F>
-double benchmark_kernel(F&& f) {
-    auto start = std::chrono::high_resolution_clock::now();
-    f();
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end - start;
-    return diff.count();
-}
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -310,36 +285,47 @@ int main(int argc, char** argv) {
 
     // Choose kernel version
     double elapsed_time;
+    int repeat_times = 2000;
     switch(version){
 	case 1:
-          elapsed_time = benchmark_kernel([&]() {
-              layernorm_forward_kernel1(q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C);
-          });
+          elapsed_time = benchmark_kernel(
+              repeat_times,
+              layernorm_forward_kernel1,
+          q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+          );
           std::cout << "Kernel 1 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	case 2:
- 	  elapsed_time = benchmark_kernel([&]() {
-              layernorm_forward_kernel2(q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C);
-          });
-          std::cout << "Kernel 2 execution time: " << elapsed_time << " seconds\n";
+ 	  elapsed_time = benchmark_kernel(
+           rapeat_times,
+          layernorm_forward_kernel2,
+          q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+      );
+      std::cout << "Kernel 2 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	case 3:
-	  elapsed_time = benchmark_kernel([&]() {
-            layernorm_forward_kernel3(q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C);
-          });
-          std::cout << "Kernel 3 execution time: " << elapsed_time << " seconds\n";
+	  elapsed_time = benchmark_kernel(
+      repeat_times,
+        layernorm_forward_kernel3,
+    q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+      );
+      std::cout << "Kernel 3 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	case 4:
-	  elapsed_time = benchmark_kernel([&]() {
-            layernorm_forward_kernel4(q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C);
-          });
-          std::cout << "Kernel 4 execution time: " << elapsed_time << " seconds\n";
+	  elapsed_time = benchmark_kernel(
+      repeat_times,
+       layernorm_forward_kernel4,
+    q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+      );
+      std::cout << "Kernel 4 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	case 5:
-	  elapsed_time = benchmark_kernel([&]() {
-            layernorm_forward_kernel5(q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C);
-          });
-          std::cout << "Kernel 5 execution time: " << elapsed_time << " seconds\n";
+	  elapsed_time = benchmark_kernel(
+          repeat_times,
+           layernorm_forward_kernel5,
+        q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+      );
+      std::cout << "Kernel 5 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	default:
 	  std::cout << "Invalid kernel number\n";
@@ -358,9 +344,10 @@ int main(int argc, char** argv) {
     layernorm_forward_cpu(cpu_out, cpu_mean, cpu_rstd, x, w, b, B, T, C);
 
     // Validate the results
-    validate_results(cpu_out, out, B * T * C);
-    validate_results(cpu_mean, mean, B * T);
-    validate_results(cpu_rstd, rstd, B * T);
+    validate_result(out, cpu_out,  "out", B * T * C, 1e-5f);
+    validate_result(mean, cpu_mean, "mean", B * T, 1e-5f);
+    validate_result(rstd, cpu_rstd, "rstd", B * T, 1e-5f);
+
 
     // Free device memory
     sycl::free(d_x, q);

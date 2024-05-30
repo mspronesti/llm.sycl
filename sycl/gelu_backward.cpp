@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include "common.hpp"
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 
@@ -106,41 +107,6 @@ void gelu_backward(int kernel_num, sycl::queue& q, float* dinp, const float* inp
     q.wait();
 }
 
-// ----------------------------------------------------------------------------
-// Utility functions
-
-float* make_random_float(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    return data;
-}
-
-void validate_result(float* result, float* reference, const char* name, long num_elements, float tol) {
-    for (long i = 0; i < num_elements; i++) {
-        if (std::fabs(result[i] - reference[i]) > tol) {
-            std::cerr << "Validation failed for " << name << " at index " << i << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << name << " validation passed." << std::endl;
-}
-
-float benchmark_kernel(int repeat_times, void (*kernel)(int, sycl::queue&, float*, const float*, const float*, int, const int), int kernel_num, sycl::queue& q, float* dinp, const float* inp, const float* dout, int N, const int block_size) {
-    float elapsed_time = 0.0f;
-
-    for (int i = 0; i < repeat_times; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        kernel(kernel_num, q, dinp, inp, dout, N, block_size);
-        q.wait();
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float, std::milli> duration = end - start;
-        elapsed_time += duration.count();
-    }
-
-    return elapsed_time / repeat_times;
-}
 
 // ----------------------------------------------------------------------------
 // Main function

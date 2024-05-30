@@ -16,30 +16,10 @@ version 2 is another naive port: parallelizes over C, loops over B,T
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include "common.hpp"
 
 #define ENABLE_BF16
 
-int* make_random_int(size_t N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
-    for (size_t i = 0; i < N; i++) {
-        arr[i] = rand() % V; // range 0..V-1
-    }
-    return arr;
-}
-
-float* make_random_float(long num_elements) {
-    float* data = new float[num_elements];
-    for (long i = 0; i < num_elements; i++) {
-        data[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    return data;
-}
-
-float* make_zeros_float(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    memset(arr, 0, N * sizeof(float)); // all zero
-    return arr;
-}
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -148,27 +128,7 @@ void encoder_backward(sycl::queue &q, int kernel_num,
     }
 }
 
-// ----------------------------------------------------------------------------
 
-void validate_results(float* ref, float* res, int size) {
-    for (int i = 0; i < size; ++i) {
-        if (std::fabs(ref[i] - res[i]) > 1e-5) {
-            std::cerr << "Result mismatch at index " << i << ": " << ref[i] << " != " << res[i] << std::endl;
-            exit(1);
-        }
-    }
-    std::cout << "Validation passed!" << std::endl;
-}
-
-// Function to benchmark kernel execution time
-template <typename F>
-double benchmark_kernel(F&& f) {
-    auto start = std::chrono::high_resolution_clock::now();
-    f();
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end - start;
-    return diff.count();
-}
 
 int main(int argc, char **argv) {
     int B = 8;
@@ -215,19 +175,19 @@ int main(int argc, char **argv) {
         encoder_backward(q, kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
         q.memcpy(dwte, d_dwte, V * C * sizeof(float)).wait();
         q.memcpy(dwpe, d_dwpe, T * C * sizeof(float)).wait();
-        validate_results(dwte, dwte, V * C);
-        validate_results(dwpe, dwpe, T * C);
+        validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
+        validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);
     }
     std::cout << "All results match. Starting benchmarks." << std::endl;
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
-        double elapsed_time = benchmark_kernel([&] {
-            for (int i = 0; i < repeat_times; i++) {
-                encoder_backward(q, kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
-            }
-        });
+        double elapsed_time = benchmark_kernel(
+            repeat_times,
+            encoder_backward, // kernel
+            q, kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size // params
+        );
         std::cout << "block_size " << block_size << " | time " << elapsed_time * 1000 << " ms" << std::endl;
     }
 

@@ -2,10 +2,10 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 
 #define ENABLE_BF16
-
+#include "common.hpp"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -16,14 +16,6 @@ void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int 
     }
 }
 
-void validate_result(const float* result, const float* reference, const std::string& name, size_t num_elements, float tolerance) {
-    for (long i = 0; i < num_elements; ++i) {
-        if (fabs(result[i] - reference[i]) > tolerance) {
-            std::cerr << "Validation failed for " << name << " at index " << i << ": " << result[i] << " != " << reference[i] << std::endl;
-            exit(1);
-        }
-    }
-}
 
 // GPU kernels
 void residual_forward_kernel(sycl::queue& q, sycl::buffer<float, 1>& out, sycl::buffer<float, 1>& inp1, sycl::buffer<float, 1>& inp2, int N, int block_size) {
@@ -58,23 +50,6 @@ void residual_forward(int kernel_num, sycl::queue& q, sycl::buffer<float, 1>& ou
 }
 
 
-float benchmark_kernel(int repeat_times, sycl::queue& q, int kernel_num, float* out, const float* inp1, const float* inp2, int N, int block_size) {
-    sycl::buffer<float, 1> d_out(out, sycl::range<1>(N));
-    sycl::buffer<float, 1> d_inp1(inp1, sycl::range<1>(N));
-    sycl::buffer<float, 1> d_inp2(inp2, sycl::range<1>(N));
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (int i = 0; i < repeat_times; ++i) {
-        residual_forward(kernel_num, q, d_out, d_inp1, d_inp2, N, block_size);
-        q.wait();
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<float, std::milli> duration_ms = end - start;
-
-    return duration_ms.count() / repeat_times;
-}
 
 
 int main(int argc, char **argv) {
@@ -109,8 +84,8 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         std::cout << "Checking block size " << block_size << "." << std::endl;
-        float elapsed_time = benchmark_kernel(1000, q, kernel_num, out, inp1, inp2, B *
-        T * C, block_size);
+
+        residual_forward_kernel(q, kernel_num, out, inp1, inp2, B * T * C, block_size)
 
         float tol = 1e-5;
         validate_result(out, out, "out", B * T * C, tol);
@@ -121,7 +96,9 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        float elapsed_time = benchmark_kernel(1000, q, kernel_num, out, inp1, inp2, B * T * C, block_size);
+        float elapsed_time = benchmark_kernel(
+                1000,
+                q, kernel_num, out, inp1, inp2, B * T * C, block_size);
         size_t memory_ops = B * T * C * 3 * 4;
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
