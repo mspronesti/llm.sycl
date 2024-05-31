@@ -21,7 +21,7 @@ version 5 allocates blocks per row instead of warps per row, same alg as 4 other
 ./layernorm_forward 5
 */
 
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 #include <iostream>
 #include <stdlib.h>
 #include <cmath>
