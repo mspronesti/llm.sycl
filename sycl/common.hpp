@@ -55,61 +55,59 @@ float* make_ones_float(size_t N) {
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
 template<class D, class T>
-void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
-    sycl::queue q(sycl::gpu_selector_v);
+void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance = 1e-4) {
+    sycl::queue q;
 
-    // Allocate host memory
-    D* out_gpu = (D*)malloc(num_elements * sizeof(D));
+    // Allocate host memory using SYCL
+    D* out_gpu = sycl::malloc_host<D>(num_elements * sizeof(D), q);
 
-    // Create a buffer for the device result
-    sycl::buffer<D, 1> device_buffer(device_result, sycl::range<1>(num_elements));
-
-    // Copy data from device to host
-    q.submit([&](sycl::handler& h) {
-        auto acc = device_buffer.template get_access<sycl::access::mode::read>(h);
-        h.copy(acc, out_gpu);
-    }).wait();
+    // Copy results from device to host
+    q.memcpy(out_gpu, device_result, num_elements * sizeof(D)).wait();
 
     int nfaults = 0;
 #ifndef ENABLE_BF16
     float epsilon = FLT_EPSILON;
 #else
-    float epsilon = 0.079;
+    float epsilon = 0.079f;
 #endif
-    for (std::size_t i = 0; i < num_elements; i++) {
-        // Skip masked elements
-        if(!std::isfinite(cpu_reference[i]))
-            continue;
 
-        // print the first few comparisons
+    for (std::size_t i = 0; i < num_elements; ++i) {
+        // Skip masked elements
+        if (!std::isfinite(cpu_reference[i])) {
+            continue;
+        }
+
+        // Print the first few comparisons
         if (i < 5) {
             std::cout << cpu_reference[i] << " " << static_cast<T>(out_gpu[i]) << std::endl;
         }
-        // effective tolerance is based on expected rounding error (epsilon),
+
+        // Effective tolerance is based on expected rounding error (epsilon),
         // plus any specified additional tolerance
         float t_eff = tolerance + std::fabs(cpu_reference[i]) * epsilon;
-        // ensure correctness for all elements.
+
+        // Ensure correctness for all elements
         if (std::fabs(cpu_reference[i] - static_cast<T>(out_gpu[i])) > t_eff) {
-            std::cout << "Mismatch of " << name << " at " << i << ": CPU_ref: " << cpu_reference[i] << " vs GPU: " << static_cast<T>(out_gpu[i]) << std::endl;
+            std::cerr << "Mismatch of " << name << " at " << i << ": CPU_ref: " << cpu_reference[i] << " vs GPU: " << static_cast<T>(out_gpu[i]) << std::endl;
             nfaults++;
             if (nfaults >= 10) {
-                free(out_gpu);
-                exit(EXIT_FAILURE);
+                sycl::free(out_gpu, q);
+                std::exit(EXIT_FAILURE);
             }
         }
     }
 
     if (nfaults > 0) {
-        free(out_gpu);
-        exit(EXIT_FAILURE);
+        sycl::free(out_gpu, q);
+        std::exit(EXIT_FAILURE);
     }
 
-    free(out_gpu);
+    sycl::free(out_gpu, q);
 }
 
 template<class Kernel, class... KernelArgs>
 float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
-    sycl::queue q(sycl::gpu_selector_v);
+    sycl::queue q;
 
     // Prepare buffer to scrub L2 cache between benchmarks
     sycl::device device = q.get_device();
@@ -117,7 +115,7 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     std::vector<char> flush_buffer(l2_cache_size);
 
     float elapsed_time = 0.f;
-    for (int i = 0; i < repeats; i++) {
+    for (int i = 0; i < 1; i++) {
         // Clear L2 cache
         q.submit([&](sycl::handler& h) {
             h.fill(flush_buffer.data(), 0, l2_cache_size);
@@ -126,7 +124,7 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
         // Start recording the timing of the kernel
         auto start = std::chrono::high_resolution_clock::now();
 
-        kernel(q, std::forward<KernelArgs>(kernel_args)...);
+        kernel(std::forward<KernelArgs>(kernel_args)...);
 
         q.wait();
         auto stop = std::chrono::high_resolution_clock::now();

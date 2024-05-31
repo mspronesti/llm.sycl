@@ -107,6 +107,25 @@ void gelu_backward(int kernel_num, sycl::queue& q, float* dinp, const float* inp
     q.wait();
 }
 
+// ----------------------------------------------------------------------------
+// Utility functions
+
+
+
+float benchmark_kernel(int repeat_times, void (*kernel)(int, sycl::queue&, float*, const float*, const float*, int, const int), int kernel_num, sycl::queue& q, float* dinp, const float* inp, const float* dout, int N, const int block_size) {
+    float elapsed_time = 0.0f;
+
+    for (int i = 0; i < repeat_times; i++) {
+        auto start = std::chrono::high_resolution_clock::now();
+        kernel(kernel_num, q, dinp, inp, dout, N, block_size);
+        q.wait();
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<float, std::milli> duration = end - start;
+        elapsed_time += duration.count();
+    }
+
+    return elapsed_time / repeat_times;
+}
 
 // ----------------------------------------------------------------------------
 // Main function

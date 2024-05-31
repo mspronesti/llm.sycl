@@ -255,12 +255,9 @@ int main(int argc, char** argv) {
     int N = B * T;
 
     // initialize inputs
-    float* x = (float*)malloc(B * T * C * sizeof(float));
-    float* w = (float*)malloc(C * sizeof(float));
-    float* b = (float*)malloc(C * sizeof(float));
-    make_random_float(x, B * T * C);
-    make_random_float(w, C);
-    make_random_float(b, C);
+    float *x = make_random_float(B * T * C);
+    float *w = make_random_float(C);
+    float *b = make_random_float(C);
 
     // initialize outputs
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -297,7 +294,7 @@ int main(int argc, char** argv) {
 	  break;
 	case 2:
  	  elapsed_time = benchmark_kernel(
-           rapeat_times,
+           repeat_times,
           layernorm_forward_kernel2,
           q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
       );
@@ -305,11 +302,11 @@ int main(int argc, char** argv) {
 	  break;
 	case 3:
 	  elapsed_time = benchmark_kernel(
-      repeat_times,
-        layernorm_forward_kernel3,
-    q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
-      );
-      std::cout << "Kernel 3 execution time: " << elapsed_time << " seconds\n";
+      	    repeat_times,
+            layernorm_forward_kernel3,
+    	    q, d_out, d_mean, d_rstd, d_x, d_w, d_b, N, C
+      	  );
+      	  std::cout << "Kernel 3 execution time: " << elapsed_time << " seconds\n";
 	  break;
 	case 4:
 	  elapsed_time = benchmark_kernel(

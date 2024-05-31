@@ -14,7 +14,7 @@ version 3 is like version 2 but uses float reads/writes
 ./encoder_forward_sycl 3
 */
 
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 #include <iostream>
 #include <cstdlib>
 #include <cassert>
