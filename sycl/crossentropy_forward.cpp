@@ -31,21 +31,18 @@ void crossentropy_forward_cpu(float* losses,
 // SYCL kernel
 
 void crossentropy_forward_kernel1(sycl::queue& q,
-                                  sycl::buffer<float, 1>& losses_buf,
-                                  sycl::buffer<float, 1>& probs_buf,
-                                  sycl::buffer<int, 1>& targets_buf,
+                                  float* d_losses,
+                                  const float* d_probs,
+                                  const int* d_targets,
                                   int B, int T, int V) {
     q.submit([&](sycl::handler& h) {
-        auto losses = losses_buf.get_access<sycl::access::mode::write>(h);
-        auto probs = probs_buf.get_access<sycl::access::mode::read>(h);
-        auto targets = targets_buf.get_access<sycl::access::mode::read>(h);
         h.parallel_for(sycl::range<1>(B * T), [=](sycl::id<1> idx) {
             int i = idx[0];
             int b = i / T;
             int t = i % T;
-            const float* probs_bt = probs.get_multi_ptr<sycl::access::decorated::no>().get() + b * T * V + t * V;
-            int ix = targets[b * T + t];
-            losses[b * T + t] = -logf(probs_bt[ix]);
+            const float* probs_bt = d_probs + b * T * V + t * V;
+            int ix = d_targets[b * T + t];
+            d_losses[b * T + t] = -logf(probs_bt[ix]);
         });
     }).wait();
 }
@@ -54,24 +51,24 @@ void crossentropy_forward_kernel1(sycl::queue& q,
 // kernel launcher
 
 void crossentropy_forward1(sycl::queue& q,
-                           sycl::buffer<float, 1>& losses_buf,
-                           sycl::buffer<float, 1>& probs_buf,
-                           sycl::buffer<int, 1>& targets_buf,
+                           float* d_losses,
+                           const float* d_probs,
+                           const int* d_targets,
                            int B, int T, int V,
                            const int block_size) {
-    crossentropy_forward_kernel1(q, losses_buf, probs_buf, targets_buf, B, T, V);
+    crossentropy_forward_kernel1(q, d_losses, d_probs, d_targets, B, T, V);
 }
 
 // kernel version dispatch
 void crossentropy_forward(sycl::queue& q, int kernel_num,
-                          sycl::buffer<float, 1>& losses_buf,
-                          sycl::buffer<float, 1>& probs_buf,
-                          sycl::buffer<int, 1>& targets_buf,
+                          float* d_losses,
+                          const float* d_probs,
+                          const int* d_targets,
                           int B, int T, int V,
                           const int block_size) {
     switch (kernel_num) {
         case 1:
-            crossentropy_forward1(q, losses_buf, probs_buf, targets_buf, B, T, V, block_size);
+            crossentropy_forward1(q, d_losses, d_probs, d_targets, B, T, V, block_size);
             break;
         default:
             std::cout << "Invalid kernel number" << std::endl;
@@ -95,10 +92,14 @@ int main(int argc, char **argv) {
     float* probs = make_random_float_01(B * T * V);
     int* targets = make_random_int(B * T, V);
 
-    // Create SYCL buffers
-    sycl::buffer<float, 1> out_buf(out, sycl::range<1>(B * T));
-    sycl::buffer<float, 1> probs_buf(probs, sycl::range<1>(B * T * V));
-    sycl::buffer<int, 1> targets_buf(targets, sycl::range<1>(B * T));
+    // Allocate device memory
+    float* d_out = sycl::malloc_device<float>(B * T, q);
+    float* d_probs = sycl::malloc_device<float>(B * T * V, q);
+    int* d_targets = sycl::malloc_device<int>(B * T, q);
+
+    // Copy data to device
+    q.memcpy(d_probs, probs, B * T * V * sizeof(float)).wait();
+    q.memcpy(d_targets, targets, B * T * sizeof(int)).wait();
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -109,33 +110,39 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     crossentropy_forward_cpu(out, probs, targets, B, T, V);
+
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512};
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         std::cout << "Checking block size " << block_size << "." << std::endl;
-        crossentropy_forward(q, kernel_num, out_buf, probs_buf, targets_buf, B, T, V, block_size);
-        validate_result(out, out_buf.get_host_access().get_multi_ptr<sycl::access::decorated::no>(), "out", B * T, 1e-5f);
+        crossentropy_forward(q, kernel_num, d_out, d_probs, d_targets, B, T, V, block_size);
+        validate_result(d_out, out, "out", B * T, 1e-5f);
     }
 
     std::cout << "All results match. Starting benchmarks." << std::endl << std::endl;
-    crossentropy_forward(q, kernel_num, out_buf, probs_buf, targets_buf, B, T, V, 32);
+    crossentropy_forward(q, kernel_num, d_out, d_probs, d_targets, B, T, V, 32);
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
        int block_size = block_sizes[j];
 
        int repeat_times = 1000;
        float elapsed_time = benchmark_kernel(
-		repeat_times, 
-		crossentropy_forward, 
-		q, kernel_num, out_buf, probs_buf, targets_buf, B, T, V, block_size
-	);
-
+           repeat_times, 
+           crossentropy_forward, 
+           q, kernel_num, d_out, d_probs, d_targets, B, T, V, block_size
+       );
 
       std::cout << "block_size " << block_size << " | time " << elapsed_time << " ms | per token " << (elapsed_time * 1'000'000 / (B * T)) << " ns" << std::endl;
     }
-    // free memory
+
+    // Free device memory
+    sycl::free(d_out, q);
+    sycl::free(d_probs, q);
+    sycl::free(d_targets, q);
+
+    // Free host memory
     free(out);
     free(probs);
     free(targets);

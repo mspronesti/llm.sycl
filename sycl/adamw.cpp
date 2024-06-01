@@ -24,68 +24,54 @@ void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory,
 }
 
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
-void adamw_kernel1(sycl::queue& q, sycl::buffer<float, 1>& params_buf, sycl::buffer<const float, 1>& grads_buf, sycl::buffer<float, 1>& m_buf, sycl::buffer<float, 1>& v_buf,
+void adamw_kernel1(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     q.submit([&](sycl::handler& h) {
-        auto params = params_buf.get_access<sycl::access::mode::read_write>(h);
-        auto grads = grads_buf.get_access<sycl::access::mode::read>(h);
-        auto m = m_buf.get_access<sycl::access::mode::read_write>(h);
-        auto v = v_buf.get_access<sycl::access::mode::read_write>(h);
-
         h.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> i) {
-            m[i] = beta1 * m[i] + (1.0f - beta1) * grads[i];
-            v[i] = beta2 * v[i] + (1.0f - beta2) * grads[i] * grads[i];
-            float m_hat = m[i] / beta1_correction;
-            float v_hat = v[i] / beta2_correction;
-            params[i] -= learning_rate * (m_hat / (sycl::sqrt(v_hat) + eps) + weight_decay * params[i]);
+            d_m_memory[i] = beta1 * d_m_memory[i] + (1.0f - beta1) * d_grads[i];
+            d_v_memory[i] = beta2 * d_v_memory[i] + (1.0f - beta2) * d_grads[i] * d_grads[i];
+            float m_hat = d_m_memory[i] / beta1_correction;
+            float v_hat = d_v_memory[i] / beta2_correction;
+            d_params[i] -= learning_rate * (m_hat / (sycl::sqrt(v_hat) + eps) + weight_decay * d_params[i]);
         });
-    });
+    }).wait();
 }
 
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
-void adamw_kernel2(sycl::queue& q, sycl::buffer<float, 1>& params_buf, sycl::buffer<const float, 1>& grads_buf, sycl::buffer<float, 1>& m_buf, sycl::buffer<float, 1>& v_buf,
+void adamw_kernel2(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     q.submit([&](sycl::handler& h) {
-        auto params = params_buf.get_access<sycl::access::mode::read_write>(h);
-        auto grads = grads_buf.get_access<sycl::access::mode::read>(h);
-        auto m = m_buf.get_access<sycl::access::mode::read_write>(h);
-        auto v = v_buf.get_access<sycl::access::mode::read_write>(h);
-
         h.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> i) {
-            float grad = grads[i];
-            float m_val = m[i];
-            float v_val = v[i];
+            float grad = d_grads[i];
+            float m_val = d_m_memory[i];
+            float v_val = d_v_memory[i];
             m_val = grad * (1.0f - beta1) + m_val * beta1;
             v_val = grad * grad * (1.0f - beta2) + v_val * beta2;
-            m[i] = m_val;
-            v[i] = v_val;
+            d_m_memory[i] = m_val;
+            d_v_memory[i] = v_val;
             m_val /= beta1_correction;
             v_val /= beta2_correction;
-            params[i] -= learning_rate * (m_val / (sycl::sqrt(v_val) + eps) + weight_decay * params[i]);
+            d_params[i] -= learning_rate * (m_val / (sycl::sqrt(v_val) + eps) + weight_decay * d_params[i]);
         });
-    });
+    }).wait();
 }
 
 void adamw(int kernel_num,
-           float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
+           float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
     // calculate the m_hat and v_hat correction terms once as they are the same for every param/thread
     float beta1_correction = 1.0f - std::pow(beta1, t);
     float beta2_correction = 1.0f - std::pow(beta2, t);
 
     sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order());
-    sycl::buffer<float, 1> params_buf(params_memory, sycl::range<1>(num_parameters));
-    sycl::buffer<const float, 1> grads_buf(grads_memory, sycl::range<1>(num_parameters));
-    sycl::buffer<float, 1> m_buf(m_memory, sycl::range<1>(num_parameters));
-    sycl::buffer<float, 1> v_buf(v_memory, sycl::range<1>(num_parameters));
 
     switch (kernel_num) {
         case 1:
-            adamw_kernel1(q, params_buf, grads_buf, m_buf, v_buf, num_parameters,
+            adamw_kernel1(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
                           learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         case 2:
-            adamw_kernel2(q, params_buf, grads_buf, m_buf, v_buf, num_parameters,
+            adamw_kernel2(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
                           learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
@@ -113,6 +99,19 @@ int main(int argc, char** argv) {
     float* m_memory = make_random_float_01(num_parameters);
     float* v_memory = make_random_float_01(num_parameters);
 
+    // Allocate device memory
+    sycl::queue q(sycl::gpu_selector_v);
+    float* d_params = sycl::malloc_device<float>(num_parameters, q);
+    float* d_grads = sycl::malloc_device<float>(num_parameters, q);
+    float* d_m_memory = sycl::malloc_device<float>(num_parameters, q);
+    float* d_v_memory = sycl::malloc_device<float>(num_parameters, q);
+
+    // Copy data to device
+    q.memcpy(d_params, params_memory, num_parameters * sizeof(float)).wait();
+    q.memcpy(d_grads, grads_memory, num_parameters * sizeof(float)).wait();
+    q.memcpy(d_m_memory, m_memory, num_parameters * sizeof(float)).wait();
+    q.memcpy(d_v_memory, v_memory, num_parameters * sizeof(float)).wait();
+
     // calculate the CPU reference
     clock_t start = clock();
     adamw_cpu(params_memory, grads_memory, m_memory, v_memory, t, num_parameters);
@@ -127,27 +126,26 @@ int main(int argc, char** argv) {
     std::cout << "Using kernel " << kernel_num << std::endl;
 
     // calculate the GPU version
-    adamw(kernel_num, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
+    adamw(kernel_num, d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
           learning_rate, beta1, beta2, eps, weight_decay);
 
     // compare
     std::cout << "Checking correctness..." << std::endl;
     std::cout << "parameters:" << std::endl;
-    validate_result(params_memory, params_memory, "params_memory", num_parameters);
+    validate_result(d_params, params_memory, "params_memory", num_parameters);
     std::cout << "first moment:" << std::endl;
-    validate_result(m_memory, m_memory, "m_memory", num_parameters);
+    validate_result(d_m_memory, m_memory, "m_memory", num_parameters);
     std::cout << "second moment:" << std::endl;
-    validate_result(v_memory, v_memory, "v_memory", num_parameters);
+    validate_result(d_v_memory, v_memory, "v_memory", num_parameters);
     std::cout << "All results match." << std::endl;
 
     // benchmark the kernel
     int repeat_times = 1000;
-    sycl::queue q;
     float elapsed_time = 0.0f;
 
     for (int i = 0; i < repeat_times; i++) {
         auto start = std::chrono::high_resolution_clock::now();
-        adamw(kernel_num, params_memory, grads_memory, m_memory, v_memory, t, num_parameters,
+        adamw(kernel_num, d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
               learning_rate, beta1, beta2, eps, weight_decay);
         q.wait();
         auto end = std::chrono::high_resolution_clock::now();
@@ -159,6 +157,12 @@ int main(int argc, char** argv) {
 
     std::cout << "time gpu " << elapsed_time << " ms" << std::endl;
     std::cout << "time cpu " << elapsed_time_cpu << " ms" << std::endl;
+
+    // Free device memory
+    sycl::free(d_params, q);
+    sycl::free(d_grads, q);
+    sycl::free(d_m_memory, q);
+    sycl::free(d_v_memory, q);
 
     // cleanup
     delete[] params_memory;
