@@ -1,9 +1,8 @@
 # Compiler
 CC          := clang++
 # Flags
-CFLAGS      := -std=c++17 -fsycl
+CFLAGS      := -std=c++20 -fsycl -fno-finite-math-only
 OPTIMIZE    := yes
-GPU         := yes
 CUDA        := no
 CUDA_ARCH   := sm_70
 HIP         := no
@@ -17,10 +16,7 @@ endif
 ifeq ($(DEBUG),yes)
     CFLAGS += -g -DDEBUG
 endif
-# GPU flag
-ifeq ($(GPU),yes)
-    CFLAGS += -DUSE_GPU
-endif
+
 # CUDA flag
 ifeq ($(CUDA),yes)
     CFLAGS += -fsycl-targets=nvptx64-nvidia-cuda -Xsycl-target-backend --cuda-gpu-arch=$(CUDA_ARCH)
