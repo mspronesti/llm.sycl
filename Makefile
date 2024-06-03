@@ -1,7 +1,7 @@
 # Compiler
 CC          := clang++
 # Flags
-CFLAGS      := -std=c++20 -fsycl -fno-finite-math-only
+CFLAGS      := -std=c++20 -fsycl -fno-finite-math-only -qmkl=parallel
 OPTIMIZE    := yes
 CUDA        := no
 CUDA_ARCH   := sm_70
