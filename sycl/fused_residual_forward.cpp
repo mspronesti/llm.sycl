@@ -53,9 +53,10 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
 
 // ----------------------------------------------------------------------------
 // GPU kernels
-void residual_forward_kernel1(sycl::queue &q, float* out, const float* inp1, const float* inp2, int N) {
+
+void residual_forward_kernel1(sycl::queue &q, float* out, const float* inp1, const float* inp2, int N, int grid_size, int block_size) {
     q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(N), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
             int idx = item.get_global_id(0);
             if (idx < N) {
                 out[idx] = static_cast<float>(static_cast<float>(inp1[idx]) + static_cast<float>(inp2[idx]));
@@ -66,9 +67,9 @@ void residual_forward_kernel1(sycl::queue &q, float* out, const float* inp1, con
 
 void layernorm_forward_kernel1(sycl::queue &q, float* out, float* mean, float* rstd,
                                const float* inp, const float* weight, const float* bias,
-                               int N, int C) {
+                               int N, int C, int grid_size, int block_size) {
     q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(N), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
             int idx = item.get_global_id(0);
             if (idx < N) {
                 const float* x = inp + idx * C;
@@ -98,11 +99,11 @@ void layernorm_forward_kernel1(sycl::queue &q, float* out, float* mean, float* r
 }
 
 void fused_residual_forward_kernel2(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
-                             const float* inp1, const float* inp2,
-                             const float* weight, const float* bias,
-                             int N, int C) {
+                                    const float* inp1, const float* inp2,
+                                    const float* weight, const float* bias,
+                                    int N, int C, int grid_size, int block_size) {
     q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(N), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
             int idx = item.get_global_id(0);
             if (idx >= N) return;
 
@@ -139,15 +140,14 @@ void fused_residual_forward_kernel2(sycl::queue &q, float* residual, float* norm
 
 // ----------------------------------------------------------------------------
 // kernel launcher
-
 void fused_residual_forward1(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
                              const float* inp1, const float* inp2,
                              const float* weight, const float* bias,
                              int N, int C, const int block_size) {
     const int grid_size_resid = ceil_div(N * C, block_size);
-    residual_forward_kernel1(q, residual, inp1, inp2, N*C);
+    residual_forward_kernel1(q, residual, inp1, inp2, N * C, grid_size_resid, block_size);
     const int grid_size_ln = ceil_div(N, block_size);
-    layernorm_forward_kernel1(q, normed, mean, rstd, residual, weight, bias, N, C);
+    layernorm_forward_kernel1(q, normed, mean, rstd, residual, weight, bias, N, C, grid_size_ln, block_size);
 }
 
 void fused_residual_forward2(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
@@ -155,7 +155,7 @@ void fused_residual_forward2(sycl::queue &q, float* residual, float* normed, flo
                              const float* weight, const float* bias,
                              int N, int C, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    fused_residual_forward_kernel2(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+    fused_residual_forward_kernel2(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, grid_size, block_size);
 }
 
 // kernel version dispatch
