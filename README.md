@@ -6,10 +6,14 @@ Let's take `attention_forward.cpp` as an example. The following will compile the
 
 ```shell
 make sycl/attention_forward
+```
+
+Then run it with
+```shell
 ./sycl/attention_forward
 ```
 
-use the `-DCUDA` and `-DCUDA_ARCH` flags to enable NVIDIA support. Similarly, `-DHIP` and `-DHIP_ARCH` for AMD support.
+Use the `-DCUDA` and `-DCUDA_ARCH` flags to enable NVIDIA support. Similarly, `-DHIP` and `-DHIP_ARCH` for AMD support.
 
 
 

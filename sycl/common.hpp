@@ -1,7 +1,3 @@
-//
-// Created by mspronesti on 30/05/24.
-//
-
 #ifndef LLM_SYCL_COMMON_HPP
 #define LLM_SYCL_COMMON_HPP
 
@@ -10,6 +6,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <chrono>
+
+float warpReduceSum(sycl::sub_group sg, float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += sycl::permute_group_by_xor(sg, val, offset);
+    }
+    return val;
+}
+
 
 // ----------------------------------------------------------------------------
 // random utils
@@ -56,7 +60,7 @@ float* make_ones_float(size_t N) {
 // testing and benchmarking utils
 template<class D, class T>
 void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance = 1e-4) {
-    sycl::queue q;
+    sycl::queue q(sycl::default_selector_v);
 
     // Allocate host memory using SYCL
     D* out_gpu = sycl::malloc_host<D>(num_elements * sizeof(D), q);
@@ -107,7 +111,7 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
 
 template<class Kernel, class... KernelArgs>
 float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
-    sycl::queue q;
+    sycl::queue q(sycl::default_selector_v);
 
     // Prepare buffer to scrub L2 cache between benchmarks
     sycl::device device = q.get_device();
@@ -136,5 +140,9 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     return elapsed_time / repeats;
 }
 
-
+//
+template<class T>
+T ceil_div(T dividend, T divisor) {
+    return (dividend + divisor - 1) / divisor;
+}
 #endif //LLM_SYCL_COMMON_HPP
