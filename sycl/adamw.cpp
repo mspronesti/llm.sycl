@@ -23,55 +23,76 @@ void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory,
     }
 }
 
+// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
+inline float lerp(float start, float end, float weight) {
+    return sycl::fma(weight, end, sycl::fma(-weight, start, start));
+}
+
+// naive fused kernel
+void adamw_kernel1(sycl::id<1> i, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+                   long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay){
+    if (i >= num_parameters) return;  // guard
+    // update the first moment (momentum)
+    d_m_memory[i] = beta1 * d_m_memory[i] + (1.0f - beta1) * d_grads[i];
+    // update the second moment (RMSprop)
+    d_v_memory[i] = beta2 * d_v_memory[i] + (1.0f - beta2) * d_grads[i] * d_grads[i];
+    float m_hat = d_m_memory[i] / beta1_correction;
+    float v_hat = d_v_memory[i] / beta2_correction;
+    d_params[i] -= learning_rate * (m_hat / (sycl::sqrt(v_hat) + eps) + weight_decay * d_params[i]);
+}
+
+
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
-void adamw_kernel1(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+void adamw_kernel2(sycl::id<1> i, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> i) {
-            d_m_memory[i] = beta1 * d_m_memory[i] + (1.0f - beta1) * d_grads[i];
-            d_v_memory[i] = beta2 * d_v_memory[i] + (1.0f - beta2) * d_grads[i] * d_grads[i];
-            float m_hat = d_m_memory[i] / beta1_correction;
-            float v_hat = d_v_memory[i] / beta2_correction;
-            d_params[i] -= learning_rate * (m_hat / (sycl::sqrt(v_hat) + eps) + weight_decay * d_params[i]);
-        });
-    }).wait();
+    if (i >= num_parameters) return;  // guard
+    float grad = d_grads[i];
+    float m = d_m_memory[i];
+    float v = d_v_memory[i];
+    // update the first moment (momentum)
+    m = lerp(grad, m, beta1);
+    d_m_memory[i] = m;
+    // update the second moment (RMSprop)
+    v = lerp(grad * grad, v, beta2);
+    d_v_memory[i] = v;
+    m /= beta1_correction;
+    v /= beta2_correction;
+    d_params[i] -= learning_rate * (m / (sycl::sqrt(v) + eps) + weight_decay * d_params[i]);
+}
+
+
+void adamw_dispatch1(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+                   long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    q.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> id) {
+        adamw_kernel1(id, d_params, d_grads, d_m_memory, d_v_memory, num_parameters, learning_rate,
+                      beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    });
 }
 
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
-void adamw_kernel2(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+void adamw_dispatch2(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> i) {
-            float grad = d_grads[i];
-            float m_val = d_m_memory[i];
-            float v_val = d_v_memory[i];
-            m_val = grad * (1.0f - beta1) + m_val * beta1;
-            v_val = grad * grad * (1.0f - beta2) + v_val * beta2;
-            d_m_memory[i] = m_val;
-            d_v_memory[i] = v_val;
-            m_val /= beta1_correction;
-            v_val /= beta2_correction;
-            d_params[i] -= learning_rate * (m_val / (sycl::sqrt(v_val) + eps) + weight_decay * d_params[i]);
-        });
-    }).wait();
+    q.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> id) {
+        adamw_kernel2(id, d_params, d_grads, d_m_memory, d_v_memory,
+                num_parameters, learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    });
+
 }
 
-void adamw(int kernel_num,
+void adamw(int kernel_num, sycl::queue &q,
            float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
     // calculate the m_hat and v_hat correction terms once as they are the same for every param/thread
     float beta1_correction = 1.0f - std::pow(beta1, t);
     float beta2_correction = 1.0f - std::pow(beta2, t);
 
-    sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order());
-
     switch (kernel_num) {
         case 1:
-            adamw_kernel1(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
+            adamw_dispatch1(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
                           learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         case 2:
-            adamw_kernel2(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
+            adamw_dispatch2(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
                           learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
@@ -100,7 +121,7 @@ int main(int argc, char** argv) {
     float* v_memory = make_random_float_01(num_parameters);
 
     // Allocate device memory
-    sycl::queue q(sycl::gpu_selector_v);
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
     float* d_params = sycl::malloc_device<float>(num_parameters, q);
     float* d_grads = sycl::malloc_device<float>(num_parameters, q);
     float* d_m_memory = sycl::malloc_device<float>(num_parameters, q);
@@ -126,7 +147,7 @@ int main(int argc, char** argv) {
     std::cout << "Using kernel " << kernel_num << std::endl;
 
     // calculate the GPU version
-    adamw(kernel_num, d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
+    adamw(kernel_num, q, d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
           learning_rate, beta1, beta2, eps, weight_decay);
 
     // compare
@@ -141,19 +162,13 @@ int main(int argc, char** argv) {
 
     // benchmark the kernel
     int repeat_times = 1000;
-    float elapsed_time = 0.0f;
-
-    for (int i = 0; i < repeat_times; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        adamw(kernel_num, d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
-              learning_rate, beta1, beta2, eps, weight_decay);
-        q.wait();
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float, std::milli> duration = end - start;
-        elapsed_time += duration.count();
-    }
-
-    elapsed_time /= repeat_times;
+    float elapsed_time = benchmark_kernel(
+        repeat_times,
+        adamw,
+        kernel_num, q,
+        d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
+        learning_rate, beta1, beta2, eps, weight_decay
+    );
 
     std::cout << "time gpu " << elapsed_time << " ms" << std::endl;
     std::cout << "time cpu " << elapsed_time_cpu << " ms" << std::endl;

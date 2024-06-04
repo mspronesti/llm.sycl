@@ -8,6 +8,7 @@
 #include <chrono>
 
 float warpReduceSum(sycl::sub_group sg, float val) {
+    #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         val += sycl::permute_group_by_xor(sg, val, offset);
     }
@@ -111,26 +112,13 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
 
 template<class Kernel, class... KernelArgs>
 float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
-    sycl::queue q(sycl::default_selector_v);
-
-    // Prepare buffer to scrub L2 cache between benchmarks
-    sycl::device device = q.get_device();
-    size_t l2_cache_size = device.get_info<sycl::info::device::global_mem_cache_size>();
-    std::vector<char> flush_buffer(l2_cache_size);
-
     float elapsed_time = 0.f;
     for (int i = 0; i < 1; i++) {
-        // Clear L2 cache
-        q.submit([&](sycl::handler& h) {
-            h.fill(flush_buffer.data(), 0, l2_cache_size);
-        }).wait();
-
         // Start recording the timing of the kernel
         auto start = std::chrono::high_resolution_clock::now();
 
         kernel(std::forward<KernelArgs>(kernel_args)...);
 
-        q.wait();
         auto stop = std::chrono::high_resolution_clock::now();
 
         std::chrono::duration<float, std::milli> duration = stop - start;
