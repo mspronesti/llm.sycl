@@ -49,105 +49,85 @@ void encoder_forward_cpu(float* out,
 // GPU kernels
 
 // naive implementation into kernel, parallelize over B,T, loop over C
-void encoder_forward_kernel1(sycl::queue &q, float* out,
+void encoder_forward_kernel1(sycl::nd_item<1> item, float* out,
                              const int* inp, const float* wte, const float* wpe,
                              int B, int T, int C) {
-    int N = B * T;
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            int b = idx[0] / T;
-            int t = idx[0] % T;
-            float* out_bt = out + b * T * C + t * C;
+        int idx = item.get_global_id(0);
+        int N = B * T;
+
+        if (idx < N) {
+            int b = idx / T;
+            int t = idx % T;
+            float *out_bt = out + b * T * C + t * C;
             int ix = inp[b * T + t];
-            const float* wte_ix = wte + ix * C;
-            const float* wpe_t = wpe + t * C;
+            const float *wte_ix = wte + ix * C;
+            const float *wpe_t = wpe + t * C;
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
             }
-        });
-    }).wait();
+        }
 }
 
 // optimized implementation: parallelize over all of B,T,C
-void encoder_forward_kernel2(sycl::queue &q, float* out,
+void encoder_forward_kernel2(sycl::nd_item<1> item, float* out,
                              const int* inp, const float* wte, const float* wpe,
                              int B, int T, int C) {
+    int idx = item.get_global_id(0);
     int N = B * T * C;
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            int bt = idx[0] / C;
-            int b = bt / T;
-            int t = bt % T;
-            int c = idx[0] % C;
 
-            int ix = inp[b * T + t];
+    if (idx < N){
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
 
-            float* out_btc = out + b * T * C + t * C + c;
-            const float* wte_ix = wte + ix * C + c;
-            const float* wpe_tc = wpe + t * C + c;
-            *out_btc = wte_ix[0] + wpe_tc[0];
-        });
-    }).wait();
+        int ix = inp[b * T + t];
+
+        float* out_btc = out + b * T * C + t * C + c;
+        const float* wte_ix = wte + ix * C + c;
+        const float* wpe_tc = wpe + t * C + c;
+        *out_btc = wte_ix[0] + wpe_tc[0];
+    }
 }
 
-// optimized implementation using float reads/writes
-void encoder_forward_kernel3(sycl::queue &q, float* out,
-                             const int* inp, const float* wte, const float* wpe,
-                             int B, int T, int C) {
-    int N = B * T * C / 4;
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            int bt = idx[0] * 4 / C;
-            int b = bt / T;
-            int t = bt % T;
-            int c = (idx[0] * 4) % C;
 
-            int ix = inp[b * T + t];
-
-            float* out_btc = reinterpret_cast<float*>(out + b * T * C + t * C + c);
-            const float* wte_ix = reinterpret_cast<const float*>(wte + ix * C + c);
-            const float* wpe_tc = reinterpret_cast<const float*>(wpe + t * C + c);
-
-            *out_btc = *wte_ix + *wpe_tc;
-        });
-    }).wait();
-}
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
 void encoder_forward1(sycl::queue &q, float* out,
                      const int* inp, const float* wte, const float* wpe,
-                     int B, int T, int C) {
-    encoder_forward_kernel1(q, out, inp, wte, wpe, B, T, C);
+                     int B, int T, int C, int block_size) {
+    const int N = B * T;
+    const int grid_size = ceil_div(N, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        encoder_forward_kernel1(id, out, inp, wte, wpe, B, T, C);
+    }).wait();
 }
 
 void encoder_forward2(sycl::queue &q, float* out,
                      const int* inp, const float* wte, const float* wpe,
-                     int B, int T, int C) {
-    encoder_forward_kernel2(q, out, inp, wte, wpe, B, T, C);
+                     int B, int T, int C, int block_size) {
+    const int N = B * T * C;
+    const int grid_size = ceil_div(N, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        encoder_forward_kernel2(id, out, inp, wte, wpe, B, T, C);
+    }).wait();
 }
 
-void encoder_forward3(sycl::queue &q, float* out,
-                     const int* inp, const float* wte, const float* wpe,
-                     int B, int T, int C) {
-    encoder_forward_kernel3(q, out, inp, wte, wpe, B, T, C);
-}
+
 
 // kernel version dispatch
 void encoder_forward(sycl::queue &q, int kernel_num,
                      float* out,
                      const int* inp, const float* wte, const float* wpe,
-                     int B, int T, int C) {
+                     int B, int T, int C,  const int block_size) {
     switch (kernel_num) {
         case 1:
-            encoder_forward1(q, out, inp, wte, wpe, B, T, C);
+            encoder_forward1(q, out, inp, wte, wpe, B, T, C, block_size);
             break;
         case 2:
-            encoder_forward2(q, out, inp, wte, wpe, B, T, C);
-            break;
-        case 3:
-            encoder_forward3(q, out, inp, wte, wpe, B, T, C);
+            encoder_forward2(q, out, inp, wte, wpe, B, T, C, block_size);
             break;
         default:
             std::cerr << "Invalid kernel number" << std::endl;
@@ -168,7 +148,7 @@ int main(int argc, char **argv) {
     float* wpe = make_random_float(T * C);
 
     // select device and create queue
-    sycl::queue q;
+    sycl::queue q(sycl::default_selector_v);
     std::cout << "Device: " << q.get_device().get_info<sycl::info::device::name>() << std::endl;
 
     // move to GPU
@@ -192,16 +172,13 @@ int main(int argc, char **argv) {
     encoder_forward_cpu(out, inp, wte, wpe, B, T, C);
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512};
 
     for (int block_size : block_sizes) {
         std::cout << "Checking block size " << block_size << "." << std::endl;
-        encoder_forward(q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C);
+        encoder_forward(q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size);
 
         float tol = 1e-5;
-#if defined(ENABLE_BF16) || defined(ENABLE_FP16)
-        tol = 1e-2f;
-#endif
 	    validate_result(out, out, "out", B * T * C, tol);
     }
 
@@ -211,8 +188,8 @@ int main(int argc, char **argv) {
         int repeat_times = 1000;
         double elapsed_time = benchmark_kernel(
             repeat_times,
-       	   encoder_forward, // kernel
-          q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C // params
+       	    encoder_forward, // kernel
+            q, kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size // params
     	);
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 3 reads and 1 write, 4 bytes each

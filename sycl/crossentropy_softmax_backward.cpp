@@ -3,6 +3,10 @@
 #include <cmath>
 #include "common.hpp"
 
+
+// ----------------------------------------------------------------------------
+// CPU code reference
+
 void crossentropy_softmax_backward_cpu(float* dlogits,
                                        const float* dlosses, const float* probs, const int* targets,
                                        int B, int T, int V) {
@@ -21,32 +25,44 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
     }
 }
 
-void crossentropy_softmax_backward_kernel1(sycl::queue& q,
-                                           float* dlogits,
-                                           const float* dlosses,
-                                           const float* probs,
-                                           const int* targets,
-                                           int B, int T, int V,
-                                           int block_size) {
-    const int N = B * T * V;
-    const int grid_size = (N + block_size - 1) / block_size;
 
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int i = item.get_global_id(0);
-            if (i < B * T * V) {
-                int b = i / (T * V);
-                int t = (i / V) % T;
-                int v = i % V;
-                float* dlogits_bt = dlogits + b * T * V + t * V;
-                const float* probs_bt = probs + b * T * V + t * V;
-                float dloss = dlosses[b * T + t];
-                int ix = targets[b * T + t];
-                float p = probs_bt[v];
-                float indicator = v == ix ? 1.0f : 0.0f;
-                dlogits_bt[v] += (p - indicator) * dloss;
-            }
-        });
+// ----------------------------------------------------------------------------
+// GPU kernels
+
+// naive kernel that just parallelizes over B,T,V
+void crossentropy_softmax_backward_kernel1(sycl::nd_item<1> item, float* dlogits,
+                                           const float* dlosses, const float* probs, const int* targets,
+                                           int B, int T, int V) {
+    int i = item.get_global_id(0);
+    if (i < B * T * V) {
+        int b = i / (T * V);
+        int t = (i / V) % T;
+        int v = i % V;
+        float* dlogits_bt = dlogits + b * T * V + t * V;
+        const float* probs_bt = probs + b * T * V + t * V;
+        float dloss = dlosses[b * T + t];
+        int ix = targets[b * T + t];
+        float p = probs_bt[v];
+        float indicator = v == ix ? 1.0f : 0.0f;
+        dlogits_bt[v] += (p - indicator) * dloss;
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// kernel launcher
+
+void crossentropy_softmax_backward1(sycl::queue& q,
+                                    float* dlogits,
+                                    const float* dlosses,
+                                    const float* probs,
+                                    const int* targets,
+                                    int B, int T, int V,
+                                    int block_size){
+    const int N = B * T * V;
+    const int grid_size = ceil_div(N, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        crossentropy_softmax_backward_kernel1(id, dlogits, dlosses, probs, targets, B, T, V);
     }).wait();
 }
 
@@ -60,13 +76,15 @@ void crossentropy_softmax_backward(int kernel_num,
                                    int block_size) {
     switch (kernel_num) {
         case 1:
-            crossentropy_softmax_backward_kernel1(q, dlogits, dlosses, probs, targets, B, T, V, block_size);
+            crossentropy_softmax_backward1(q, dlogits, dlosses, probs, targets, B, T, V, block_size);
             break;
         default:
             std::cerr << "Invalid kernel number\n";
             std::exit(1);
     }
 }
+
+
 
 int main(int argc, char** argv) {
     srand(0);
@@ -75,7 +93,7 @@ int main(int argc, char** argv) {
     int T = 1024;
     int V = 50257;
 
-    sycl::queue q;
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
 
     // Allocate host memory and initialize with random values
     float* probs = make_random_float(B * T * V);
@@ -111,10 +129,7 @@ int main(int argc, char** argv) {
         q.memset(d_dlogits, 0, B * T * V * sizeof(float)).wait();
         std::cout << "Checking block size " << block_size << "." << std::endl;
         crossentropy_softmax_backward(kernel_num, q, d_dlogits, d_dlosses, d_probs, d_targets, B, T, V, block_size);
-        float* h_dlogits = (float*)malloc(B * T * V * sizeof(float));
-        q.memcpy(h_dlogits, d_dlogits, B * T * V * sizeof(float)).wait();
-        validate_result(h_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
-        free(h_dlogits);
+        validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
     }
 
     std::cout << "All results match. Starting benchmarks.\n\n";

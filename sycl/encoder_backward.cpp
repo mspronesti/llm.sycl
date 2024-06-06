@@ -14,8 +14,10 @@ version 2 is another naive port: parallelizes over C, loops over B,T
 #include <iostream>
 #include <cmath>
 
-#define ENABLE_BF16
 #include "common.hpp"
+
+// ----------------------------------------------------------------------------
+// CPU code reference
 
 void encoder_backward_cpu(float* dwte, float* dwpe,
                           float* dout, int* inp,
@@ -35,61 +37,79 @@ void encoder_backward_cpu(float* dwte, float* dwpe,
     }
 }
 
-void encoder_backward_kernel1(sycl::queue& q,
+// ----------------------------------------------------------------------------
+// GPU kernels
+
+// naive implementation with atomics
+void encoder_backward_kernel1(sycl::nd_item<1> item,
+                              float* dwte, float* dwpe,
+                              const float* dout, const int* inp,
+                              int B, int T, int C) {
+    int idx = item.get_global_id(0);
+    const int N = B * T * C;
+    if (idx < N) {
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
+
+        int ix = inp[b * T + t];
+
+        const float* dout_btc = dout + b * T * C + t * C + c;
+        float* dwte_ix = dwte + ix * C + c;
+        float* dwpe_tc = dwpe + t * C + c;
+
+        auto atomic_dwte = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwte_ix);
+        auto atomic_dwpe = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwpe_tc);
+
+        atomic_dwte.fetch_add(*dout_btc);
+        atomic_dwpe.fetch_add(*dout_btc);
+    }
+}
+
+// naive implementation that parallelizes over C and loops over B,T,
+// but it gets rid of atomics
+void encoder_backward_kernel2(sycl::nd_item<1> item,
+                              float* dwte, float* dwpe,
+                              const float* dout, const int* inp,
+                              int B, int T, int C) {
+    int c = item.get_global_id(0);
+    if (c >= C) return;
+    int BT = B * T;
+    for (int i = 0; i < BT; i++) {
+        int t = i % T;
+        int ix = inp[i];
+        float dout_btc = dout[i * C + c];
+        dwte[ix * C + c] += dout_btc;
+        dwpe[t * C + c] += dout_btc;
+    }
+}
+
+
+void encoder_backward1(sycl::queue& q,
                               float* dwte, float* dwpe,
                               const float* dout, const int* inp,
                               int B, int T, int C,
                               int block_size) {
     const int N = B * T * C;
-    const int grid_size = (N + block_size - 1) / block_size;
+    const int grid_size =  ceil_div(N, block_size);;
 
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int idx = item.get_global_id(0);
-            if (idx < N) {
-                int bt = idx / C;
-                int b = bt / T;
-                int t = bt % T;
-                int c = idx % C;
-
-                int ix = inp[b * T + t];
-
-                const float* dout_btc = dout + b * T * C + t * C + c;
-                float* dwte_ix = dwte + ix * C + c;
-                float* dwpe_tc = dwpe + t * C + c;
-
-                auto atomic_dwte = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwte_ix);
-                auto atomic_dwpe = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwpe_tc);
-
-                atomic_dwte.fetch_add(*dout_btc);
-                atomic_dwpe.fetch_add(*dout_btc);
-            }
-        });
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item) {
+        encoder_backward_kernel1(item, dwte, dwpe, dout, inp, B, T, C);
     }).wait();
 }
 
-void encoder_backward_kernel2(sycl::queue& q,
+void encoder_backward2(sycl::queue& q,
                               float* dwte, float* dwpe,
                               const float* dout, const int* inp,
                               int B, int T, int C,
                               int block_size) {
-    const int grid_size = (C + block_size - 1) / block_size;
-
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int c = item.get_global_id(0);
-            if (c >= C) return;
-            int BT = B * T;
-            for (int i = 0; i < BT; i++) {
-                int t = i % T;
-                int ix = inp[i];
-                float dout_btc = dout[i * C + c];
-                dwte[ix * C + c] += dout_btc;
-                dwpe[t * C + c] += dout_btc;
-            }
-        });
+    const int grid_size = ceil_div(C, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item) {
+             encoder_backward_kernel2(item, dwte, dwpe, dout, inp, B, T, C);
     }).wait();
 }
+
 
 void encoder_backward(int kernel_num,
                       sycl::queue& q,
@@ -99,10 +119,10 @@ void encoder_backward(int kernel_num,
                       int block_size) {
     switch (kernel_num) {
         case 1:
-            encoder_backward_kernel1(q, dwte, dwpe, dout, inp, B, T, C, block_size);
+            encoder_backward1(q, dwte, dwpe, dout, inp, B, T, C, block_size);
             break;
         case 2:
-            encoder_backward_kernel2(q, dwte, dwpe, dout, inp, B, T, C, block_size);
+            encoder_backward2(q, dwte, dwpe, dout, inp, B, T, C, block_size);
             break;
         default:
             std::cerr << "Invalid kernel number\n";
@@ -118,7 +138,7 @@ int main(int argc, char** argv) {
     int C = 768;
     int V = 50257;
 
-    sycl::queue q;
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
 
     // Allocate host memory and initialize with random values
     float* dout = make_random_float(B * T * C);

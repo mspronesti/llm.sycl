@@ -3,9 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
-#include <chrono>
 
-#define ENABLE_BF16
 #include "common.hpp"
 
 // ----------------------------------------------------------------------------
@@ -28,35 +26,33 @@ void crossentropy_forward_cpu(float* losses,
 }
 
 // ----------------------------------------------------------------------------
-// SYCL kernel
+// GPU kernel
 
-void crossentropy_forward_kernel1(sycl::queue& q,
-                                  float* d_losses,
-                                  const float* d_probs,
-                                  const int* d_targets,
+void crossentropy_forward_kernel1(sycl::nd_item<1> id, float* losses,
+                                  const float* probs, const int* targets,
                                   int B, int T, int V) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(B * T), [=](sycl::id<1> idx) {
-            int i = idx[0];
-            int b = i / T;
-            int t = i % T;
-            const float* probs_bt = d_probs + b * T * V + t * V;
-            int ix = d_targets[b * T + t];
-            d_losses[b * T + t] = -logf(probs_bt[ix]);
-        });
-    }).wait();
+    int i = id.get_global_id(0);
+    if (i < B * T) {
+        int b = i / T;
+        int t = i % T;
+        const float* probs_bt = probs + b * T * V + t * V;
+        int ix = targets[b * T + t];
+        losses[b * T + t] = -sycl::log(probs_bt[ix]);
+    }
 }
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void crossentropy_forward1(sycl::queue& q,
-                           float* d_losses,
-                           const float* d_probs,
-                           const int* d_targets,
+void crossentropy_forward1(sycl::queue &queue, float* losses,
+                           const float* probs, const int* targets,
                            int B, int T, int V,
                            const int block_size) {
-    crossentropy_forward_kernel1(q, d_losses, d_probs, d_targets, B, T, V);
+    const int N = B * T;
+    const int grid_size = ceil_div(N, block_size);
+    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        crossentropy_forward_kernel1(id, losses, probs, targets, B, T, V);
+    }).wait();
 }
 
 // kernel version dispatch
@@ -85,7 +81,7 @@ int main(int argc, char **argv) {
     int T = 1024;
     int V = 50257;
 
-    sycl::queue q(sycl::gpu_selector_v);
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * sizeof(float));
