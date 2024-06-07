@@ -15,6 +15,85 @@ float warpReduceSum(sycl::sub_group sg, float val) {
     return val;
 }
 
+// ----------------------------------------------------------------------------
+// Packed128 data structure, which forces the compiler to use 128-bit loads/stores
+// in GPUs that support (the LDG.128 and STS.128 instructions)
+// This is a bit similar to the use of float4 in the case of 32-bit floats, but
+// supports arbitrary precision.
+
+template<class ElementType>
+struct alignas(16) Packed128 {
+    Packed128() = default;
+
+    explicit Packed128(sycl::int4 bits) {
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        *reinterpret_cast<sycl::int4*>(payload) = bits;
+    }
+
+    ElementType& operator[](int index) {
+        return payload[index];
+    }
+
+    const ElementType& operator[](int index) const {
+        return payload[index];
+    }
+
+    sycl::int4 get_bits() const {
+        sycl::int4 bits;
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        // Fix this later
+        bits = *reinterpret_cast<const sycl::int4*>(payload);
+        return bits;
+    }
+
+    // e.g. sizeof(int4) is 16 (4 X 4 bytes), sizeof(bfloat16) = 2, so size = 8
+    // so in the case where ElementType = bfloat16, we store 8 elements in one Packed128
+    static constexpr const int size = sizeof(sycl::int4) / sizeof(ElementType);
+    ElementType payload[size];
+};
+
+// short-form typedef
+typedef Packed128<float> f128;
+
+// load a Packed128 from an aligned memory address
+template<class ElementType>
+Packed128<ElementType> load128(const ElementType* address) {
+    return Packed128<ElementType>{*reinterpret_cast<const sycl::int4*>(address)};
+}
+
+// load a Packed128 from an aligned memory address with streaming cache hint
+template<class ElementType>
+Packed128<ElementType> load128cs(const ElementType* address) {
+    return Packed128<ElementType>{*reinterpret_cast<const sycl::int4*>(address)};
+}
+
+// store a Packed128 to an aligned memory address
+template<class ElementType>
+void store128(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
+}
+
+// store a Packed128 to an aligned memory address with streaming cache hint
+template<class ElementType>
+void store128cs(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
+}
+
+// ----------------------------------------------------------------------------
+// reduced/mixed precision utilities
+
+#if defined(ENABLE_BF16)
+typedef sycl::ext::oneapi::bfloat16 floatX;
+typedef sycl::ext::oneapi::bfloat16 floatN;
+#elif defined(ENABLE_FP16)
+typedef sycl::half floatX;
+typedef sycl::half floatN;
+#else
+typedef float floatX;
+typedef float floatN;
+#endif
+
+typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------
 // random utils
@@ -59,6 +138,20 @@ float* make_ones_float(size_t N) {
 
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
+
+template<class TargetType>
+void memcpy_convert(TargetType* d_ptr, float* h_ptr, size_t count, sycl::queue &q) {
+    // copy from host to device with data type conversion.
+    TargetType* converted = (TargetType*)malloc(count * sizeof(TargetType));
+    for (int i = 0; i < count; i++) {
+        converted[i] = (TargetType)h_ptr[i];
+    }
+    q.memcpy(d_ptr, converted, count * sizeof(TargetType)).wait();
+    free(converted);
+    return;
+}
+
+
 template<class D, class T>
 void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance = 1e-4) {
     sycl::queue q(sycl::default_selector_v);
