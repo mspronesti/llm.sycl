@@ -3,6 +3,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
+
+#define ENABLE_BF16
 #include "common.hpp"
 
 // ----------------------------------------------------------------------------
@@ -54,114 +56,193 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-void residual_forward_kernel1(sycl::queue &q, float* out, const float* inp1, const float* inp2, int N, int grid_size, int block_size) {
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int idx = item.get_global_id(0);
-            if (idx < N) {
-                out[idx] = static_cast<float>(static_cast<float>(inp1[idx]) + static_cast<float>(inp2[idx]));
-            }
-        });
-    }).wait();
+void residual_forward_kernel1(sycl::nd_item<1> item, floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+    int idx = item.get_global_id(0);
+    if (idx < N) {
+        out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
+    }
 }
 
-void layernorm_forward_kernel1(sycl::queue &q, float* out, float* mean, float* rstd,
-                               const float* inp, const float* weight, const float* bias,
-                               int N, int C, int grid_size, int block_size) {
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int idx = item.get_global_id(0);
-            if (idx < N) {
-                const float* x = inp + idx * C;
-                float m = 0.0f;
-                for (int i = 0; i < C; i++) {
-                    m += static_cast<float>(x[i]);
-                }
-                m = m / C;
-                float v = 0.0f;
-                for (int i = 0; i < C; i++) {
-                    float xshift = static_cast<float>(x[i]) - m;
-                    v += xshift * xshift;
-                }
-                v = v / C;
-                float s = 1.0f / sycl::sqrt(v + 1e-5f);
-                float* out_idx = out + idx * C;
-                for (int i = 0; i < C; i++) {
-                    float n = (s * (static_cast<float>(x[i]) - m));
-                    float o = n * static_cast<float>(weight[i]) + static_cast<float>(bias[i]);
-                    out_idx[i] = o;
-                }
-                mean[idx] = m;
-                rstd[idx] = s;
-            }
-        });
-    }).wait();
+void layernorm_forward_kernel1(sycl::nd_item<1> item, floatX* out, floatX* mean, floatX* rstd,
+                               const floatX* inp, const floatX* weight, const floatX* bias,
+                               int N, int C) {
+    int idx = item.get_global_id(0);
+    float eps = 1e-5f;
+
+    if (idx < N) {
+        // seek to the input position inp[idx,:]
+        const floatX* x = inp + idx * C;
+        // calculate the mean
+        float m = 0.0f;
+        for (int i = 0; i < C; i++) {
+            m += (float)x[i];
+        }
+        m = m / C;
+        // calculate the variance (without any bias correction)
+        float v = 0.0f;
+        for (int i = 0; i < C; i++) {
+            float xshift = (float)x[i] - m;
+            v += xshift * xshift;
+        }
+        v = v / C;
+        // calculate the rstd
+        float s = 1.0f / sqrtf(v + eps);
+        // seek to the output position in out[idx,:]
+        floatX* out_idx = out + idx * C;
+        for (int i = 0; i < C; i++) {
+            float n = (s * ((float)x[i] - m)); // normalized output
+            float o = n * (float)weight[i] + (float)bias[i]; // scale and shift it
+            out_idx[i] = o; // write
+        }
+        // cache the mean and rstd for the backward pass later
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
 }
 
-void fused_residual_forward_kernel2(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
-                                    const float* inp1, const float* inp2,
-                                    const float* weight, const float* bias,
-                                    int N, int C, int grid_size, int block_size) {
-    q.submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_size * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int idx = item.get_global_id(0);
-            if (idx >= N) return;
+void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                    const floatX* inp1, const floatX* inp2,
+                                    const floatX* weight, const floatX* bias,
+                                    int N, int C) {
 
-            float* residual_ptr = residual + idx * C;
-            float* normed_ptr = normed + idx * C;
-            const float* inp1_ptr = inp1 + idx * C;
-            const float* inp2_ptr = inp2 + idx * C;
+    int idx = item.get_global_id(0);
+    if(idx > N) return;
 
-            float m = 0.0f;
-            for (int c = 0; c < C; ++c) {
-                float out = static_cast<float>(inp1_ptr[c]) + static_cast<float>(inp2_ptr[c]);
-                m += out;
-                residual_ptr[c] = out;
-            }
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
 
-            m = m / C;
-            float v = 0.0f;
-            for (int c = 0; c < C; c++) {
-                float xshift = static_cast<float>(residual_ptr[c]) - m;
-                v += xshift * xshift;
-            }
-            v = v / C;
-            float s = 1.0f / sycl::sqrt(v + 1e-5f);
-            for (int c = 0; c < C; c++) {
-                float n = (s * (static_cast<float>(residual_ptr[c]) - m));
-                float o = n * static_cast<float>(weight[c]) + static_cast<float>(bias[c]);
-                normed_ptr[c] = o;
-            }
-            mean[idx] = m;
-            rstd[idx] = s;
-        });
-    }).wait();
+    float eps = 1e-5f;
+
+    float m = 0.0f;
+    for(int c = 0; c < C; ++c) {
+        float out = (float)inp1[c] + (float)inp2[c];
+        m += out;
+        residual[c] = out;
+    }
+
+    m = m / C;
+    float v = 0.0f;
+    for (int c = 0; c < C; c++) {
+        float xshift = (float)residual[c] - m;
+        v += xshift * xshift;
+    }
+    v = v / C;
+
+    // calculate the rstd
+    float s = 1.0f / sqrtf(v + eps);
+    for (int c = 0; c < C; c++) {
+        float n = (s * ((float)residual[c] - m)); // normalized output
+        float o = n * (float)weight[c] + (float)bias[c]; // scale and shift it
+        normed[c] = o; // write
+    }
+    // cache the mean and rstd for the backward pass later
+    mean[idx] = m;
+    rstd[idx] = s;
 }
+
+// This is not working
+/*void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C) {
+    constexpr const int WarpSize = 32;
+    int idx = item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
+    if (idx >= N) return;
+
+    auto sg = item.get_sub_group();
+
+    int thread_id = item.get_local_id(1);
+
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
+
+    float eps = 1e-5f;
+    float m = 0.0f;
+    for (int c = thread_id; c < C; c += WarpSize) {
+        float out = static_cast<float>(inp1[c]) + static_cast<float>(inp2[c]);
+        m += out;
+        residual[c] = out;
+    }
+
+    m = warpReduceSum(sg, m);
+
+    m = m / C;
+    float v = 0.0f;
+    for (int c = thread_id; c < C; c += WarpSize) {
+        float xshift = static_cast<float>(residual[c]) - m;
+        v += xshift * xshift;
+    }
+
+    v = warpReduceSum(sg, v);
+    v = v / C;
+
+    // calculate the rstd
+    float s = 1.0f / sycl::sqrt(v + eps);
+    for (int c = thread_id; c < C; c += WarpSize) {
+        float n = s * (static_cast<float>(residual[c]) - m); // normalized output
+        float o = n * static_cast<float>(weight[c]) + static_cast<float>(bias[c]); // scale and shift it
+        normed[c] = o; // write
+    }
+    // cache the mean and rstd for the backward pass later
+    if (thread_id == 0) {
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
+}*/
 
 // ----------------------------------------------------------------------------
 // kernel launcher
-void fused_residual_forward1(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
-                             const float* inp1, const float* inp2,
-                             const float* weight, const float* bias,
+void fused_residual_forward1(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
                              int N, int C, const int block_size) {
     const int grid_size_resid = ceil_div(N * C, block_size);
-    residual_forward_kernel1(q, residual, inp1, inp2, N * C, grid_size_resid, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size_resid * block_size, block_size), [=](sycl::nd_item<1> id){
+        residual_forward_kernel1(id, residual, inp1, inp2, N * C);
+    }).wait();
+
     const int grid_size_ln = ceil_div(N, block_size);
-    layernorm_forward_kernel1(q, normed, mean, rstd, residual, weight, bias, N, C, grid_size_ln, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size_ln * block_size, block_size), [=](sycl::nd_item<1> id) {
+        layernorm_forward_kernel1(id, normed, mean, rstd, residual, weight, bias, N, C);
+    }).wait();
 }
 
-void fused_residual_forward2(sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
-                             const float* inp1, const float* inp2,
-                             const float* weight, const float* bias,
+void fused_residual_forward2(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
                              int N, int C, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    fused_residual_forward_kernel2(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, grid_size, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        fused_residual_forward_kernel2(id, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+    }).wait();
 }
 
+/*void fused_residual_forward3(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                      const floatX* inp1, const floatX* inp2,
+                                      const floatX* weight, const floatX* bias,
+                                      int N, int C, const int block_size) {
+    int block_y = block_size / 32;
+    int grid_size = ceil_div(N, block_y);
+    sycl::nd_range<2> grid = sycl::nd_range<2>(
+            sycl::range<2>(grid_size * block_y, 32),
+            sycl::range<2>(block_y, 32)
+    );
+
+    q.parallel_for(grid, [=](sycl::nd_item<2> item) {
+            fused_residual_forward_kernel3(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+    }).wait();
+}*/
+
 // kernel version dispatch
-void fused_residual_forward(int kernel_num, sycl::queue &q, float* residual, float* normed, float* mean, float* rstd,
-                            const float* inp1, const float* inp2,
-                            const float* weight, const float* bias,
+void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                            const floatX* inp1, const floatX* inp2,
+                            const floatX* weight, const floatX* bias,
                             int N, int C, const int block_size) {
     switch (kernel_num) {
         case 1:
@@ -170,9 +251,12 @@ void fused_residual_forward(int kernel_num, sycl::queue &q, float* residual, flo
         case 2:
             fused_residual_forward2(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
             break;
+  /*      case 3:
+            fused_residual_forward3(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
+            break;*/
         default:
             std::cout << "Invalid kernel number\n";
-            exit(1);
+            std::exit(1);
     }
 }
 
@@ -202,37 +286,36 @@ int main(int argc, const char **argv) {
     sycl::queue q(sycl::default_selector_v);
 
     // allocate device memory
-    float* d_residual = sycl::malloc_device<float>(B * T * C, q);
-    float* d_normed = sycl::malloc_device<float>(B * T * C, q);
-    float* d_inp1 = sycl::malloc_device<float>(B * T * C, q);
-    float* d_inp2 = sycl::malloc_device<float>(B * T * C, q);
-    float* d_mean = sycl::malloc_device<float>(B * T, q);
-    float* d_rstd = sycl::malloc_device<float>(B * T, q);
-    float* d_weight = sycl::malloc_device<float>(C, q);
-    float* d_bias = sycl::malloc_device<float>(C, q);
+    floatX* d_residual = sycl::malloc_device<floatX>(B * T * C, q);
+    floatX* d_normed = sycl::malloc_device<floatX>(B * T * C, q);
+    floatX* d_inp1 = sycl::malloc_device<floatX>(B * T * C, q);
+    floatX* d_inp2 = sycl::malloc_device<floatX>(B * T * C, q);
+    floatX* d_mean = sycl::malloc_device<floatX>(B * T, q);
+    floatX* d_rstd = sycl::malloc_device<floatX>(B * T, q);
+    floatX* d_weight = sycl::malloc_device<floatX>(C, q);
+    floatX* d_bias = sycl::malloc_device<floatX>(C, q);
 
     // copy data to device
-    q.memcpy(d_inp1, inp1, B * T * C * sizeof(float)).wait();
-    q.memcpy(d_inp2, inp2, B * T * C * sizeof(float)).wait();
-    q.memcpy(d_weight, weight, C * sizeof(float)).wait();
-    q.memcpy(d_bias, bias, C * sizeof(float)).wait();
+    memcpy_convert(d_inp1, inp1, B * T * C, q);
+    memcpy_convert(d_inp2, inp2, B * T * C, q);
+    memcpy_convert(d_weight, weight, C, q);
+    memcpy_convert(d_bias, bias, C, q);
 
     // first check the correctness of the kernel
     residual_forward_cpu(residual, inp1, inp2, B * T * C);
     layernorm_forward_cpu(normed, mean, rstd, residual, weight, bias, B, T, C);
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512};
 
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
+    for (int block_size: block_sizes) {
         std::cout << "Checking block size " << block_size << "." << std::endl;
 
-        q.memset(d_residual, 0, B * T * C * sizeof(float)).wait();
+        q.memset(d_residual, 0, B * T * C * sizeof(floatX)).wait();
         fused_residual_forward(kernel_num, q, d_residual, d_normed, d_mean, d_rstd, d_inp1, d_inp2, d_weight, d_bias,
                                B * T, C, block_size);
 
-        float tol = 1e-5;
+        float tol = std::is_same_v<floatX, float> ? 1e-5 : 5e-2;
         validate_result(d_residual, residual, "residual", B * T * C, tol);
         validate_result(d_mean, mean, "mean", B * T, tol);
         validate_result(d_rstd, rstd, "rstd", B * T, tol);
@@ -241,16 +324,17 @@ int main(int argc, const char **argv) {
 
     std::cout << "All results match. Starting benchmarks.\n\n";
 
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-
+    for (int block_size: block_sizes) {
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(repeat_times, fused_residual_forward, kernel_num,
-                                              q, d_residual, d_normed, d_mean, d_rstd, d_inp1, d_inp2, d_weight, d_bias,
-                                              B * T, C, block_size);
+        float elapsed_time = benchmark_kernel(
+                repeat_times,
+                fused_residual_forward,
+                kernel_num, q, d_residual, d_normed, d_mean, d_rstd, d_inp1, d_inp2,
+                d_weight, d_bias, B * T, C, block_size
+        );
 
         // napkin math: estimate the memory bandwidth achieved
-        long memory_ops = B * T * (C * 4 + 2) * sizeof(float);
+        long memory_ops = B * T * (C * 4 + 2) * sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
         float toks_per_msec = B * T / elapsed_time / 1e3;
 

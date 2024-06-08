@@ -83,120 +83,137 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 
 // ---------------------------------------
 // GPU kernels
-void attention_query_key_kernel1(sycl::queue& q, float* preatt, const float* inp, int B, int T, int C, int NH) {
-    q.parallel_for(sycl::range<1>(B * NH * T * T), [=](sycl::id<1> idx) {
-        int index = idx[0];
-        if (index < B * NH * T * T) {
-            int t2 = index % T;
-            int t = (index / T) % T;
-            if (t2 > t) {
-                // autoregressive mask
-                preatt[index] = -INFINITY;
-                return;
+void attention_query_key_kernel1(sycl::nd_item<1> id, float* preatt, const float* inp,
+                                 int B, int T, int C, int NH) {
+    int idx = id.get_global_id(0);
+    int total_threads = B * NH * T * T;
+
+    if (idx < total_threads) {
+        int t2 = idx % T;
+        int t = (idx / T) % T;
+        if (t2 > t) {
+            // autoregressive mask
+            preatt[idx] = -INFINITY;
+            return;
+        }
+        int h = (idx / (T * T)) % NH;
+        int b = idx / (NH * T * T);
+
+        int C3 = C*3;
+        int hs = C / NH; // head size
+        const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+        const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+
+        // (query_t) dot (key_t2)
+        float val = 0.0f;
+        for (int i = 0; i < hs; i++) {
+            val += query_t[i] * key_t2[i];
+        }
+
+        val *= 1.0f / sycl::sqrt(static_cast<float>(hs));
+
+        preatt[idx] = val;
+    }
+}
+
+void attention_softmax_kernel1(sycl::nd_item<1> id, float* att, const float* preatt,
+                               int B, int T, int NH) {
+    int idx = id.get_global_id(0);
+    int total_threads = B * T * NH;
+
+    if (idx < total_threads) {
+        int h = idx % NH;
+        int t = (idx / NH) % T;
+        int b = idx / (NH * T);
+
+        const float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+        float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+
+        // find maxval
+        float maxval = -10000.0f; // TODO something better
+        for (int t2 = 0; t2 <= t; t2++) {
+            if (preatt_bth[t2] > maxval) {
+                maxval = preatt_bth[t2];
             }
-            int h = (index / (T * T)) % NH;
-            int b = index / (NH * T * T);
+        }
 
-            int C3 = C * 3;
-            int hs = C / NH; // head size
-            const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-            const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+        // calculate the exp and keep track of sum
+        float expsum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float expv = sycl::exp(preatt_bth[t2] - maxval);
+            expsum += expv;
+            att_bth[t2] = expv;
+        }
+        float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
-            // (query_t) dot (key_t2)
-            float val = 0.0f;
+        // normalize to get the softmax
+        for (int t2 = 0; t2 < T; t2++) {
+            if (t2 <= t) {
+                att_bth[t2] *= expsum_inv;
+            } else {
+                // causal attention mask. not strictly necessary to set to zero here
+                // only doing this explicitly for debugging and checking to PyTorch
+                att_bth[t2] = 0.0f;
+            }
+        }
+    }
+}
+
+void attention_value_kernel1(sycl::nd_item<1> id, float* out, const float* att, const float* inp,
+                             int B, int T, int C, int NH) {
+    int idx = id.get_global_id(0);
+    int total_threads = B * T * NH;
+
+    if (idx < total_threads) {
+        int h = idx % NH;
+        int t = (idx / NH) % T;
+        int b = idx / (NH * T);
+
+        int C3 = C*3;
+        int hs = C / NH; // head size
+
+        float* out_bth = out + b * T * C + t * C + h * hs;
+        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+
+        for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+        for (int t2 = 0; t2 <= t; t2++) {
+            const  float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+            float att_btht2 = att_bth[t2];
             for (int i = 0; i < hs; i++) {
-                val += query_t[i] * key_t2[i];
-            }
-            val *= 1.0 / sqrtf(hs);
-
-            preatt[index] = val;
-        }
-    }).wait();
-}
-
-void attention_softmax_kernel1(sycl::queue& q, float* att, const float* preatt, int B, int T, int NH) {
-    q.parallel_for(sycl::range<1>(B * T * NH), [=](sycl::id<1> idx) {
-        int index = idx[0];
-        if (index < B * T * NH) {
-            int h = index % NH;
-            int t = (index / NH) % T;
-            int b = index / (NH * T);
-
-            const float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
-            float* att_bth = att + b * NH * T * T + h * T * T + t * T;
-
-            // find maxval
-            float maxval = -10000.0f; // TODO something better
-            for (int t2 = 0; t2 <= t; t2++) {
-                if (preatt_bth[t2] > maxval) {
-                    maxval = preatt_bth[t2];
-                }
-            }
-
-            // calculate the exp and keep track of sum
-            float expsum = 0.0f;
-            for (int t2 = 0; t2 <= t; t2++) {
-                float expv = sycl::exp(preatt_bth[t2] - maxval);
-                expsum += expv;
-                att_bth[t2] = expv;
-            }
-            float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
-
-            // normalize to get the softmax
-            for (int t2 = 0; t2 < T; t2++) {
-                if (t2 <= t) {
-                    att_bth[t2] *= expsum_inv;
-                } else {
-                    // causal attention mask. not strictly necessary to set to zero here
-                    // only doing this explicitly for debugging and checking to PyTorch
-                    att_bth[t2] = 0.0f;
-                }
+                out_bth[i] += att_btht2 * value_t2[i];
             }
         }
-    }).wait();
+    }
 }
 
-void attention_value_kernel1(sycl::queue& q, float* out, const float* att, const float* inp, int B, int T, int C, int NH) {
-    q.parallel_for(sycl::range<1>(B * T * NH), [=](sycl::id<1> idx) {
-        int index = idx[0];
-        if (index < B * T * NH) {
-            int h = index % NH;
-            int t = (index / NH) % T;
-            int b = index / (NH * T);
+// ----------------------------------------------------------------------------
+// kernel launcher
 
-            int C3 = C * 3;
-            int hs = C / NH; // head size
-
-            float* out_bth = out + b * T * C + t * C + h * hs;
-            const float* att_bth = att + b * NH * T * T + h * T * T + t * T;
-
-            for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-            for (int t2 = 0; t2 <= t; t2++) {
-                const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2; // +C*2 because it's value
-                float att_btht2 = att_bth[t2];
-                for (int i = 0; i < hs; i++) {
-                    out_bth[i] += att_btht2 * value_t2[i];
-                }
-            }
-        }
-    }).wait();
-}
-
-void attention_forward1(sycl::queue& q, float* out, float* preatt, float* att, const float* inp, int B, int T, int C, int NH, const int block_size) {
+void attention_forward1(sycl::queue& q, float* out, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
     // attention calculation
     int total_threads = B * NH * T * T;
     int num_blocks = ceil_div(total_threads, block_size);
-    attention_query_key_kernel1(q, preatt, inp, B, T, C, NH);
+    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        attention_query_key_kernel1(id, preatt, inp, B, T, C, NH);
+    });
 
     // softmax and value accumulation
     total_threads = B * T * NH;
     num_blocks = ceil_div(total_threads, block_size);
-    attention_softmax_kernel1(q, att, preatt, B, T, NH);
-    attention_value_kernel1(q, out, att, inp, B, T, C, NH);
+    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        attention_softmax_kernel1(id, att, preatt, B, T, NH);
+    });
+    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        attention_value_kernel1(id, out, att, inp, B, T, C, NH);
+    });
 }
 
+
 int main(int argc, char **argv) {
-    sycl::queue q(sycl::default_selector_v);
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order{});
     int B = 8;
     int T = 1024;
     int C = 768;
