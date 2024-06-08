@@ -13,6 +13,8 @@ version 2 packs input into 128 bit memory reads
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <cmath>
+
+#define ENABLE_BF16
 #include "common.hpp"
 
 // ----------------------------------------------------------------------------
@@ -27,66 +29,82 @@ void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int 
 // ----------------------------------------------------------------------------
 // SYCL kernels
 
-void residual_forward_kernel1(sycl::queue& q, float* out, const float* inp1, const float* inp2, int N) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            int i = idx[0];
-            out[i] = inp1[i] + inp2[i];
-        });
-    }).wait();
+void residual_forward_kernel1(sycl::nd_item<1> id, floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+    int idx = id.get_global_id(0);
+    if (idx < N) {
+        out[idx] = inp1[idx] + inp2[idx];
+    }
 }
 
-void residual_forward_kernel2(sycl::queue& q, float* out, const float* inp1, const float* inp2, int N) {
-    constexpr int vector_size = 4;
-    int packed_size = N / vector_size;
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(packed_size), [=](sycl::id<1> idx) {
-            int i = idx[0] * vector_size;
-            sycl::vec<float, vector_size> v_inp1 = *reinterpret_cast<const sycl::vec<float, vector_size>*>(inp1 + i);
-            sycl::vec<float, vector_size> v_inp2 = *reinterpret_cast<const sycl::vec<float, vector_size>*>(inp2 + i);
-            sycl::vec<float, vector_size> v_out = v_inp1 + v_inp2;
-            *reinterpret_cast<sycl::vec<float, vector_size>*>(out + i) = v_out;
-        });
-    }).wait();
+void residual_forward_kernel2(sycl::nd_item<1> id, floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+    int idx = id.get_global_id(0) * x128::size;
+    if (idx < N) {
+        x128 packed_out;
+        x128 packed_inp1 = load128cs(inp1 + idx);
+        x128 packed_inp2 = load128cs(inp2 + idx);
+        for (int k = 0; k < packed_inp1.size; ++k)
+        {
+            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
+        }
+        store128(out + idx, packed_out);
+    }
 }
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void residual_forward(int kernel_num, sycl::queue& q, float* d_out, const float* d_inp1, const float* d_inp2, int N, const int block_size) {
+void residual_forward1(sycl::queue &q, floatX* out, const floatX* inp1, const floatX* inp2, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size);
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        residual_forward_kernel1(id, out, inp1, inp2, N);
+    }).wait();
+}
+
+void residual_forward2(sycl::queue &q, floatX* out, const floatX* inp1, const floatX* inp2, int N, const int block_size) {
+    const int grid_size = ceil_div(N, (int)(block_size * x128::size));
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        residual_forward_kernel2(id, out, inp1, inp2, N);
+    }).wait();
+}
+
+
+// kernel version dispatch
+void residual_forward(int kernel_num, sycl::queue& q, floatX* d_out, const floatX* d_inp1, const floatX* d_inp2, int N, const int block_size) {
     switch (kernel_num) {
         case 1:
-            residual_forward_kernel1(q, d_out, d_inp1, d_inp2, N);
+            residual_forward1(q, d_out, d_inp1, d_inp2, N, block_size);
             break;
         case 2:
-            residual_forward_kernel2(q, d_out, d_inp1, d_inp2, N);
+            residual_forward2(q, d_out, d_inp1, d_inp2, N, block_size);
             break;
         default:
             std::cerr << "Invalid kernel number\n";
-            exit(1);
+            std::exit(1);
     }
 }
 
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
+    srand(0);
+
     int B = 8;
     int T = 1024;
     int C = 768;
     int N = B * T * C;
-
+    
     // create host memory of random numbers
     float* out = new float[N];
     float* inp1 = make_random_float(N);
     float* inp2 = make_random_float(N);
 
     // move to device
-    sycl::queue q;
-    float* d_out = sycl::malloc_device<float>(N, q);
-    float* d_inp1 = sycl::malloc_device<float>(N, q);
-    float* d_inp2 = sycl::malloc_device<float>(N, q);
-    q.memcpy(d_inp1, inp1, N * sizeof(float)).wait();
-    q.memcpy(d_inp2, inp2, N * sizeof(float)).wait();
+    sycl::queue q(sycl::default_selector_v);
+    floatX* d_out = sycl::malloc_device<floatX>(N, q);
+    floatX* d_inp1 = sycl::malloc_device<floatX>(N, q);
+    floatX* d_inp2 = sycl::malloc_device<floatX>(N, q);
+    memcpy_convert(d_inp1, inp1, N, q);
+    memcpy_convert(d_inp2, inp2, N, q);;
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -99,12 +117,16 @@ int main(int argc, char **argv) {
     residual_forward_cpu(out, inp1, inp2, N);
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512};
 
     for (int block_size : block_sizes) {
         std::cout << "Checking block size " << block_size << ".\n";
         residual_forward(kernel_num, q, d_out, d_inp1, d_inp2, N, block_size);
+#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         float tol = 1e-5;
+#else
+        float tol = 1e-2f;
+#endif
         validate_result(d_out, out, "out", N, tol);
     }
 
@@ -112,8 +134,14 @@ int main(int argc, char **argv) {
 
     for (int block_size : block_sizes) {
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(repeat_times, residual_forward, kernel_num, q, d_out, d_inp1, d_inp2, N, block_size);
+        float elapsed_time = benchmark_kernel(
+                repeat_times,
+                residual_forward,
+                kernel_num, q, d_out, d_inp1, d_inp2, N, block_size
+        );
 
+        // napkin math: estimate the memory bandwidth achieved
+        // for each (B,T,C) output element, we do 2 read and 1 write, 4 bytes each
         long memory_ops = N * 3 * 4;
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
