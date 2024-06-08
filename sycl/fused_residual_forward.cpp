@@ -144,7 +144,7 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
 }
 
 // This is not working
-/*void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
                              int N, int C) {
@@ -170,7 +170,7 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
         residual[c] = out;
     }
 
-    m = warpReduceSum(sg, m);
+    m = sycl::reduce_over_group(sg, m, sycl::plus<float>());
 
     m = m / C;
     float v = 0.0f;
@@ -179,7 +179,7 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
         v += xshift * xshift;
     }
 
-    v = warpReduceSum(sg, v);
+    v = sycl::reduce_over_group(sg, v, sycl::plus<float>());
     v = v / C;
 
     // calculate the rstd
@@ -194,7 +194,7 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
         mean[idx] = m;
         rstd[idx] = s;
     }
-}*/
+}
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -223,7 +223,7 @@ void fused_residual_forward2(sycl::queue &q, floatX* residual, floatX* normed, f
     }).wait();
 }
 
-/*void fused_residual_forward3(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+void fused_residual_forward3(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                                       const floatX* inp1, const floatX* inp2,
                                       const floatX* weight, const floatX* bias,
                                       int N, int C, const int block_size) {
@@ -237,7 +237,7 @@ void fused_residual_forward2(sycl::queue &q, floatX* residual, floatX* normed, f
     q.parallel_for(grid, [=](sycl::nd_item<2> item) {
             fused_residual_forward_kernel3(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
     }).wait();
-}*/
+}
 
 // kernel version dispatch
 void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
@@ -251,9 +251,9 @@ void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, fl
         case 2:
             fused_residual_forward2(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
             break;
-  /*      case 3:
+        case 3:
             fused_residual_forward3(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
-            break;*/
+            break;
         default:
             std::cout << "Invalid kernel number\n";
             std::exit(1);

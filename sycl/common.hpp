@@ -7,13 +7,6 @@
 #include <cstdlib>
 #include <chrono>
 
-float warpReduceSum(sycl::sub_group sg, float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += sycl::permute_group_by_xor(sg, val, offset);
-    }
-    return val;
-}
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
