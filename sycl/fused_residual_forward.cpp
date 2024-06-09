@@ -143,7 +143,6 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
     rstd[idx] = s;
 }
 
-// This is not working
 void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
