@@ -163,13 +163,17 @@ int main(int argc, char** argv) {
     }
     std::cout << "Using kernel " << kernel_num << std::endl;
 
+    // first check the correctness of the kernel
+    encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
+
     // Set up block sizes
     int block_sizes[] = {32, 64, 128, 256, 512};
 
     // Check the correctness of the kernel
     for (int block_size : block_sizes) {
         std::cout << "Checking block size " << block_size << "." << std::endl;
-        encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
+        q.memset(d_dwte, 0, V * C * sizeof(float));
+        q.memset(d_dwpe, 0, T * C * sizeof(float));
         encoder_backward(kernel_num, q, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
         validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
         validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);
