@@ -104,7 +104,7 @@ void matmul_tri_naive(sycl::nd_item<3> id, float* p, int ps, const float* k, int
             int j = j_base + jo;
             float val = 0;
             for (int s = 0; s < hs; ++s) {
-                val += k[i * ks + s] * q[j * qs + s];
+                val += q[i * ks + s] * k[j * qs + s];
             }
             p[i * ps + j] = val * alpha;
         }
@@ -113,7 +113,7 @@ void matmul_tri_naive(sycl::nd_item<3> id, float* p, int ps, const float* k, int
 
 
 // reorganize loops to enable data reuse
-void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+void matmul_tri_registers(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
     int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
 
@@ -121,17 +121,17 @@ void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k,
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; ++s) {
+    for (int hs = 0; hs < HS; ++hs) {
         float lhs[8];
         float rhs[8];
         for (int u = 0; u < 8; ++u) {
-            lhs[u] = k[u * ks + s];
-            rhs[u] = q[u * qs + s];
+            lhs[u] = q[u * QS + hs];
+            rhs[u] = k[u * KS + hs];
         }
 
         for (int i = 0; i < 8; ++i) {
@@ -143,7 +143,7 @@ void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k,
 
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j) {
-            p[i * ps + j] = vals[i][j] * alpha;
+            p[i * PS + j] = vals[i][j] * alpha;
         }
     }
 }
@@ -158,7 +158,7 @@ void st_vec(float* address, sycl::float4 val) {
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+void matmul_tri3(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
     int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
 
@@ -166,21 +166,21 @@ void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; s += 4) {
+    for (int hs = 0; hs < HS; hs += 4) {
         // load in float4 to improve coalescing
         sycl::float4 rhs[8];
         for (int u = 0; u < 8; ++u) {
-            rhs[u] = ld_vec(q + u * qs + s);
+            rhs[u] = ld_vec(k + u * KS + hs);
         }
 
         for (int i = 0; i < 8; ++i) {
-            // no need to keep lhs around for the i loop, its only reused in the j loop anyway.
-            sycl::float4 lhs = ld_vec(k + i * ks + s);
+            // no need to keep lhs around for the i loop, it's only reused in the j loop anyway.
+            sycl::float4 lhs = ld_vec(q + i * QS + hs);
             for (int j = 0; j < 8; ++j) {
                 vals[i][j] += lhs.x() * rhs[j].x();
                 vals[i][j] += lhs.y() * rhs[j].y();
@@ -197,7 +197,7 @@ void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
             result.y() = vals[i][j + 1] * alpha;
             result.z() = vals[i][j + 2] * alpha;
             result.w() = vals[i][j + 3] * alpha;
-            st_vec(p + i * ps + j, result);
+            st_vec(p + i * PS + j, result);
         }
     }
 }
@@ -302,7 +302,7 @@ void trimul_launcher(sycl::queue &queue, float* out, const float* inp, int B, in
         const float *k = inp + b * T * C3 + h * hs + C;
         float *r = out + (b * NH + h) * T * T;
 
-        matmul_tri(id, r, T, q, C3, k, C3, T, hs, scale);
+        matmul_tri(id, r, T, k, C3, q, C3, T, hs, scale);
     }).wait();
 }
 
