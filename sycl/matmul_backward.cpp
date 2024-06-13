@@ -54,46 +54,37 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
 // ----------------------------------------------------------------------------
 // GPU kernels
 // naive kernel to backpropagate only the bias, it's just a sum :'(
-void matmul_backward_bias_kernel_naive(sycl::queue &q, float* dbias, const float* dout, int B, int T, int OC) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(OC), [=](sycl::id<1> o) {
-            if (o < OC) {
-                double sum = 0.0;
-                for (int b = 0; b < B; b++) {
-                    for (int t = 0; t < T; t++) {
-                        sum += dout[b * T * OC + t * OC + o];
-                    }
-                }
-                dbias[o] = sum;
+void matmul_backward_bias_kernel_naive(sycl::nd_item<1> id, float* dbias, const float* dout, int B, int T, int OC) {
+    int o = id.get_global_id(0);
+    if (o < OC) {
+        // nix the double
+        float sum = 0.0f;
+        for (int b = 0; b < B; b++) {
+            for (int t = 0; t < T; t++) {
+                sum += dout[b * T * OC + t * OC + o];
             }
-        });
-    });
+        }
+        dbias[o] = sum;
+    }
 }
 
 // use shared memory and coarsening + reductions
-void matmul_backward_bias_kernel_faster(sycl::queue &q, float* dbias, const float* dout, int B, int T, int OC, int block_size) {
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> shared(sycl::range<1>(block_size), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(OC * block_size), sycl::range<1>(block_size)), [=](sycl::nd_item<1> item) {
-            int o = item.get_group(0);
-            int tid = item.get_local_id(0);
-            float sum = 0.0f; // Change from double to float
-            for (int i = tid; i < B * T; i += block_size) {
-                sum += dout[i * OC + o];
-            }
-            shared[tid] = sum;
-            item.barrier(sycl::access::fence_space::local_space);
-            for (int stride = block_size / 2; stride > 0; stride /= 2) {
-                if (tid < stride) {
-                    shared[tid] += shared[tid + stride];
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-            }
-            if (tid == 0) {
-                dbias[o] = shared[0];
-            }
-        });
-    }).wait();
+void matmul_backward_bias_kernel_faster(sycl::nd_item<1> item, float* dbias, const float* dout, int B, int T, int OC) {
+    int o = item.get_group(0); // range [0, OC)
+    int tid = item.get_local_linear_id(); // range [0, block_size)
+    int block_size = item.get_local_range(0);
+    const float* x = dout + o;
+    // thread coarsening
+    float sum = 0.0f;
+    for (int i = tid; i < B * T; i += block_size) {
+        sum += x[i * OC];
+    }
+    float sum_over_group = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<>());
+
+    // write the final result (at thread 0) to global memory
+    if (tid == 0) {
+        dbias[o] = sum_over_group;
+    }
 }
 
 
@@ -116,7 +107,13 @@ void matmul_backward1(sycl::queue &q, float* dinp, float* dweight, float* dbias,
     // backward to bias, if given
     if (dbias != nullptr) {
         const int block_size = 512;
-        matmul_backward_bias_kernel_faster(q, dbias, dout, B, T, OC, block_size);
+        const int grid_size = OC;
+
+        q.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item){
+                matmul_backward_bias_kernel_faster(item, dbias, dout, B, T, OC);
+            });
+        });
     }
 }
 
@@ -209,6 +206,7 @@ int main(int argc, char** argv) {
     free(dout);
     free(inp);
     free(weight);
+    free(ones);
     sycl::free(d_dinp, q);
     sycl::free(d_dweight, q);
     sycl::free(d_dbias, q);
