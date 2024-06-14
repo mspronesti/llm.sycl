@@ -186,6 +186,169 @@ void attention_value_kernel1(sycl::nd_item<1> id, float* out, const float* att, 
     }
 }
 
+void permute_kernel(sycl::nd_item<1> id, float* q, float* k, float* v,
+                    const float* inp,
+                    int B, int N, int NH, int d) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+    int idx = id.get_global_id(0);
+
+    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = \
+            (b * N * 3 * NH * d)
+            +   (n * 3 * NH * d)
+            +       (0 * NH * d)
+            +          (nh_ * d)
+            +                d_;
+
+        q[idx] = inp[inp_idx];
+        k[idx] = inp[inp_idx + NH * d];
+        v[idx] = inp[inp_idx + 2 * (NH * d)];
+    }
+}
+
+void unpermute_kernel(sycl::nd_item<1> id, const float* inp, float *out, int B, int N, int NH, int d) {
+    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    int idx = id.get_global_id(0);
+
+    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        out[other_idx] = inp[idx];
+    }
+}
+
+void attention_forward_kernel2(
+        sycl::nd_item<2> id,
+        const float* Q,
+        const float* K,
+        const float* V,
+        const int N,
+        const int d,
+        const int Tc,
+        const int Tr,
+        const int Bc,
+        const int Br,
+        const float softmax_scale,
+        float* l,
+        float* m,
+        float* O,
+        sycl::local_accessor<float> sram_acc
+) {
+    int tx = id.get_local_id(1);
+    int bx = id.get_group(1); int by = id.get_group(0);  // batch and head index
+
+    // Offset into Q,K,V,O,l,m - different for each batch and head
+    int qkv_offset = (bx * id.get_group_range(0) * N * d) + (by * N * d);
+    int lm_offset = (bx * id.get_group_range(0) * N) + (by * N);  // offset for l and m
+
+    // Define SRAM for Q,K,V,S
+    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    float* sram = sram_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+    float* Qi = sram;
+    float* Kj = &sram[tile_size];
+    float* Vj = &sram[tile_size * 2];
+    float* S = &sram[tile_size * 3];
+
+    for (int j = 0; j < Tc; j++) {
+
+        // Load Kj, Vj to SRAM
+        for (int x = 0; x < d; x++) {
+            Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
+            Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+        }
+        sycl::group_barrier(id.get_group());  // such that the inner loop can use the correct Kj, Vj
+
+        for (int i = 0; i < Tr; i++)  {
+            // if past the end of the sequence, break
+            if (i * Br + tx >= N) {
+                break;
+            }
+
+            // Load Qi to SRAM, l and m to registers
+            for (int x = 0; x < d; x++) {
+                Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+            }
+            float row_m_prev = m[lm_offset + (Br * i) + tx];
+            float row_l_prev = l[lm_offset + (Br * i) + tx];
+
+            // S = QK^T, row_m = rowmax(S)
+            // S[tx][y] = Sum_{x = 0}^{d-1} {Qi[tx][x] * Kj[y][x]}
+            // row_m = Max_{y = 0}^{Bc-1} S[tx][y]
+            // with causal masking
+            float row_m = -INFINITY;
+            for (int y = 0; y < Bc; y++) {
+                if (j * Bc + y >= N) {
+                    break;
+                }
+                float sum = 0;
+                for (int x = 0; x < d; x++) {
+                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+                }
+                sum *= softmax_scale;
+                if (i * Br + tx < j * Bc + y)
+                    sum = -INFINITY;
+                S[(Bc * tx) + y] = sum;
+
+                if (sum > row_m)
+                    row_m = sum;
+            }
+
+            // implement softmax with causal masking
+            // P = exp(S - row_m), row_l = rowsum(P)
+            // P[tx][y] = exp(S[tx][y] - row_m)
+            float row_l = 0;
+            for (int y = 0; y < Bc; y++) {
+                if (j * Bc + y >= N) {
+                    break;
+                }
+                if (i * Br + tx < j * Bc + y)
+                    S[(Bc * tx) + y] = 0;
+                else
+                    S[(Bc * tx) + y] = sycl::native::exp(S[(Bc * tx) + y] - row_m);
+                row_l += S[(Bc * tx) + y];
+            }
+
+            // Compute new m and l
+            float row_m_new = sycl::max(row_m_prev, row_m);
+            float row_l_new = (sycl::native::exp(row_m_prev - row_m_new) * row_l_prev) + (sycl::native::exp(row_m - row_m_new) * row_l);
+
+            // Write O, l, m to HBM
+            for (int x = 0; x < d; x++) {
+                float pv = 0;  // Pij * Vj
+                for (int y = 0; y < Bc; y++) {
+                    if (j * Bc + y >= N) {
+                        break;
+                    }
+                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+                }
+                O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
+                    * ((row_l_prev * sycl::native::exp(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
+                    + (sycl::native::exp(row_m - row_m_new) * pv));
+            }
+            m[lm_offset + (Br * i) + tx] = row_m_new;
+            l[lm_offset + (Br * i) + tx] = row_l_new;
+        }
+        sycl::group_barrier(id.get_group());  // otherwise, thread can use the wrong Kj, Vj in inner loop
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -209,8 +372,120 @@ void attention_forward1(sycl::queue& q, float* out, float* preatt, float* att,
     q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         attention_value_kernel1(id, out, att, inp, B, T, C, NH);
     });
+    q.wait();
 }
 
+
+void attention_forward2(sycl::queue &queue, float* out,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // TODO there should be no mallocs inside any of these functions!
+    // not fixing this because we don't intend to use attention_forward2,
+    // it seems to be way too slow as is
+
+    // these are hardcoded to 32 for now
+    const int Bc = 32;
+    const int Br = 32;
+    // renaming these to be consistent with the kernel
+    // const int B = B;
+    const int nh = NH;
+    const int N = T;
+    const int d = C / NH;
+    // more
+    const int Tc = ceil((float) N / Bc);
+    const int Tr = ceil((float) N / Br);
+    // Use a float literal because Intel client GPUs do not support fp64
+    const float softmax_scale = 1.0f / sqrt(d);
+    // create some temporary memory
+    float* l;
+    float* m;
+    l = sycl::malloc_device<float>(B * nh * N, queue);
+    m = sycl::malloc_device<float>(B * nh * N, queue);
+
+    queue.memset(l, 0, B * nh * N * sizeof(float));
+    queue.memset(m, -10000.0f, B * nh * N * sizeof(float));
+
+    // calculate SRAM size needed per block, ensure we have enough shared memory
+    int col_tile_size = Bc * d;  // size of Kj, Vj
+    int row_tile_size = Br * d;  // size of Qi
+    const int sram_size =
+            (2 * col_tile_size * sizeof(float))  // SRAM size for Kj, Vj
+            + (row_tile_size * sizeof(float))  // SRAM size for Qi
+            + (Bc * Br * sizeof(float));  // SRAM size for S
+    int max_sram_size;
+    max_sram_size = queue.get_device().get_info<sycl::info::device::local_mem_size>();
+
+    if (sram_size > max_sram_size) {
+        printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+        printf("SRAM size exceeds maximum shared memory per block\n");
+        printf("Try decreasing col_tile_size or row_tile_size further\n");
+        exit(1);
+    }
+
+    // grid and block dims
+    sycl::range<2> grid_dim(nh, B);  // batch_size x num_heads
+    sycl::range<2> block_dim(1, Br);  // Br threads per block
+
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, nh, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
+    // so we have to permute the tensor using a kernel with block_size
+    float *q, *k, *v;
+    q = sycl::malloc_device<float>(B * T * C, queue);
+    k = sycl::malloc_device<float>(B * T * C, queue);
+    v = sycl::malloc_device<float>(B * T * C, queue);
+
+    int total_threads = B * N * nh * d;
+    int num_blocks = ceil_div(total_threads, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        permute_kernel(id, q, k, v, inp, B, N, nh, d);
+    });
+
+
+    // now actually call the flash attention kernel
+    queue.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> sram_acc(ceil_div(sram_size, (int) sizeof(float)), h);
+        h.parallel_for(sycl::nd_range<2>(grid_dim * block_dim, block_dim), [=](sycl::nd_item<2> id) {
+            attention_forward_kernel2(id, q, k, v, N, d, Tc, Tr, Bc, Br, softmax_scale, l, m, out, sram_acc);
+        });
+    });
+
+    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        unpermute_kernel(id, out, q, B, N, nh, d);
+    });
+    queue.memcpy(out, q, B * T * C * sizeof(float));
+
+    queue.wait();
+
+    // free memory
+    sycl::free(l, queue);
+    sycl::free(m, queue);
+    sycl::free(q, queue);
+    sycl::free(k, queue);
+    sycl::free(v, queue);
+}
+
+// kernel version dispatch
+void attention_forward(int kernel_num,
+                       sycl::queue &q,
+                       float* out, float* vaccum,
+                       float* qkvr, float* preatt, float* att,
+                       float* inp,
+                       int B, int T, int C, int NH,
+                       const int block_size) {
+    switch (kernel_num) {
+        case 1:
+            attention_forward1(q, out, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 2:
+            attention_forward2(q, out, inp, B, T, C, NH, block_size);
+            break;
+        default:
+            std::cout << "Invalid kernel number\n";
+            std::exit(1);
+    }
+}
 
 int main(int argc, char **argv) {
     sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order{});
@@ -227,47 +502,56 @@ int main(int argc, char **argv) {
 
     // move to GPU
     float* d_out = sycl::malloc_device<float>(B * T * C, q);
+    float* d_vaccum = sycl::malloc_device<float>(B * T * C, q);
+    float* d_qkvr = sycl::malloc_device<float>(B * T * 3 * C, q);
     float* d_preatt = sycl::malloc_device<float>(B * NH * T * T, q);
     float* d_att = sycl::malloc_device<float>(B * NH * T * T, q);
     float* d_inp = sycl::malloc_device<float>(B * T * 3 * C, q);
     q.memcpy(d_inp, inp, B * T * 3 * C * sizeof(float)).wait();
 
     // read kernel_num from command line
-    /*int kernel_num = 1;
+    int kernel_num = 1;
     if (argc > 1) {
         kernel_num = std::atoi(argv[1]);
     }
-    std::cout << "Using kernel " << kernel_num << std::endl;*/
+    std::cout << "Using kernel " << kernel_num << std::endl;
     int block_sizes[] = {32, 64, 128, 256, 512};
 
     // Lower accuracy requirements for FP16 (1e-4f also too much for TF32 on kernels 3 & 4)
-    float accuracy_threshold = 1e-3f;
+    float accuracy_threshold = (kernel_num <= 4) ? 1e-3f : 1e-2f;
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         std::cout << "Checking block size " << block_size << "." << std::endl;
-        attention_forward1(q, d_out, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
-        q.memcpy(out, d_out, B * T * C * sizeof(float)).wait();
-        q.memcpy(att, d_att, B * NH * T * T * sizeof(float)).wait();
-        q.memcpy(preatt, d_preatt, B * NH * T * T * sizeof(float)).wait();
+        attention_forward(kernel_num, q, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        // all kernels should produce the correct output out
         validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
-        validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
-        validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
-
+        // but as for preatt and att, things get a bit more complicated:
+        if (kernel_num != 2 && kernel_num < 5) {
+            // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
+            // that estimates the softmax online and never materializes preatt/att
+            validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
+        }
+        if (kernel_num != 2 && kernel_num < 4) {
+            // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
+            // into the softmax, so preatt is off by 1.0f / sqrt(HS)
+            // but att and out (checked below) should match.
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
+        }
     }
     std::cout << "All results match. Starting benchmarks." << std::endl;
 
     // benchmark speed of the kernel
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
+    for (int block_size: block_sizes) {
         int repeat_times = 100;
 
         float elapsed_time = benchmark_kernel(
             repeat_times,
-            attention_forward1,
-            q, d_out, d_preatt, d_att, d_inp, B, T, C, NH, block_size
+            attention_forward,
+            kernel_num, q, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp,
+            B, T, C, NH, block_size
         );
 
         std::cout << "block_size " << block_size << " | time " << elapsed_time << " ms" << std::endl;
