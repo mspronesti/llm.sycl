@@ -1,4 +1,5 @@
 #include <sycl/sycl.hpp>
+#include <oneapi/mkl.hpp>
 #include <iostream>
 #include <cmath>
 #include <cstdlib>
@@ -83,6 +84,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 
 // ---------------------------------------
 // GPU kernels
+
 void attention_query_key_kernel1(sycl::nd_item<1> id, float* preatt, const float* inp,
                                  int B, int T, int C, int NH) {
     int idx = id.get_global_id(0);
@@ -234,6 +236,23 @@ void unpermute_kernel(sycl::nd_item<1> id, const float* inp, float *out, int B, 
     }
 }
 
+void scale_kernel(sycl::nd_item<1> id, float* inp, float scale, int B, int NH, int T) {
+    // scales the pre-softmax attention scores by scale
+    // and sets the autoregressive locations to -INFINITY
+    int idx = id.get_global_id(0);
+    if (idx < B * NH * T * T) {
+        int rest = idx % (NH * T * T);
+        rest = rest % (T * T);
+        int t2 = rest / T;
+        int t = rest % T;
+        if (t > t2) {
+            inp[idx] = -INFINITY;
+        } else {
+            inp[idx] *= scale;
+        }
+    }
+}
+
 void attention_forward_kernel2(
         sycl::nd_item<2> id,
         const float* Q,
@@ -348,6 +367,118 @@ void attention_forward_kernel2(
         sycl::group_barrier(id.get_group());  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
+
+void softmax_forward_kernel4(sycl::nd_item<1> id, float* out, const float* inp, int N, int C) {
+    // out is (N, C) just like inp. Each row of inp will get softmaxed.
+    // same as kernel3, but can handle any block size (multiple of 32)
+    // each row of C elements is handled by block_size threads
+    // furthermore, each block_size threads get executed in warps of 32 threads
+
+    int idx = id.get_group(0);
+    int tid = id.get_local_linear_id();
+
+    // one row of inp, i.e. inp[idx, :] of shape (C,)
+    const float* x = inp + idx * C;
+
+    // first, thread coarsening by directly accessing global memory in series
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += id.get_local_range(0)) {
+        maxval = sycl::fmax(maxval, x[i]);
+    }
+    maxval = sycl::reduce_over_group(id.get_group(), maxval, sycl::maximum<float>());
+
+    // broadcast the max to all threads
+    float offset = maxval;
+
+    // compute expf and write the result to global memory
+    for (int i = tid; i < C; i += id.get_local_range(0)) {
+        out[idx * C + i] = sycl::exp(x[i] - offset);
+    }
+
+    // okay now we calculated exp(x - max(x))
+    // step 2: sum all the values and divide by the sum
+
+    // thread coarsening for sum
+    x = out + idx * C;
+    float sumval = 0.0f;
+    for (int i = tid; i < C; i += id.get_local_range(0)) {
+        sumval += x[i];
+    }
+    sumval = sycl::reduce_over_group(id.get_group(), sumval, sycl::plus<float>());
+
+    // broadcast the sum to all threads
+    float sum = sumval;
+
+    // divide the whole row by the sum
+    for (int i = tid; i < C; i += id.get_local_range(0)) {
+        out[idx * C + i] = x[i] / sum;
+    }
+}
+
+float& vec_at(sycl::float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
+float vec_at(const sycl::float4& vec, int index) {
+    return reinterpret_cast<const float*>(&vec)[index];
+}
+
+
+void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperature, const float* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    sycl::sub_group warp = id.get_sub_group();
+    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const float* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    const sycl::float4* x_vec = reinterpret_cast<const sycl::float4*>(x);
+    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+        sycl::float4 v = x_vec[i];
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = sycl::fmax(maxval, vec_at(v, k));
+        }
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += sycl::exp(inv_temperature * (vec_at(v, k) - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = sycl::fmax(maxval, x[4*pos_by_4 + warp.get_local_linear_id()]);
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        sumval += sycl::exp(inv_temperature * (x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+    }
+
+    float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>{});
+    sumval *= sycl::exp(inv_temperature * (maxval - global_maxval));
+
+    float sum = sycl::reduce_over_group(warp, sumval, sycl::plus<float>{});
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = sycl::exp(inv_temperature * (x[i] - global_maxval));
+        out[idx * T + i] = ev * norm;
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -466,6 +597,143 @@ void attention_forward2(sycl::queue &queue, float* out,
     sycl::free(v, queue);
 }
 
+void attention_forward3(sycl::queue &queue, float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int HS = C / NH; // head size
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        permute_kernel(id, q, k, v, inp, B, T, NH, HS);
+    }).wait();
+
+    // batched matrix multiply with oneMKL blas
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    auto trans = oneapi::mkl::transpose::trans;
+    auto no_trans = oneapi::mkl::transpose::nontrans;
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                trans, no_trans,
+                                                T, T, HS,
+                                                &alpha,
+                                                k, HS, T * HS,
+                                                q, HS, T * HS,
+                                                &beta,
+                                                preatt, T, T * T,
+                                                B * NH
+    );
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0f / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = ceil_div(total_threads, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        scale_kernel(id, preatt, scale, B, NH, T);
+    }).wait();
+
+    // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    queue.parallel_for(sycl::nd_range<1>(grid_size * softmax_block_size, softmax_block_size), [=](sycl::nd_item<1> id) {
+        softmax_forward_kernel4(id, att, preatt, B * NH * T, T);
+    }).wait();
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                no_trans, no_trans,
+                                                HS, T, T,
+                                                &alpha,
+                                                v, HS, T * HS,
+                                                att, T, T * T,
+                                                &beta,
+                                                vaccum, HS, T * HS,
+                                                B * NH
+    );
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = ceil_div(B * T * C, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        unpermute_kernel(id, vaccum, out, B, T, NH, HS);
+    }).wait();
+}
+
+void attention_forward4(sycl::queue &queue, float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int HS = C / NH; // head size
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        permute_kernel(id, q, k, v, inp, B, T, NH, HS);
+    }).wait();
+
+    // batched matrix multiply with cuBLAS
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    auto trans = oneapi::mkl::transpose::trans;
+    auto no_trans = oneapi::mkl::transpose::nontrans;
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                trans, no_trans,
+                                                T, T, HS,
+                                                &alpha,
+                                                k, HS, T * HS,
+                                                q, HS, T * HS,
+                                                &beta,
+                                                preatt, T, T * T,
+                                                B * NH
+    );
+
+    // multiply all elements of preatt elementwise by scale
+    // Use a float literal because Intel client GPUs do not support fp64
+    float scale = 1.0f / sqrtf(HS);
+    int softmax_block_size = 256;
+    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    queue.parallel_for(sycl::nd_range<1>(grid_size * softmax_block_size, softmax_block_size), [=](sycl::nd_item<1> id) {
+        softmax_forward_kernel5(id, att, scale, preatt, B * NH, T);
+    }).wait();
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                no_trans, no_trans,
+                                                HS, T, T,
+                                                &alpha,
+                                                v, HS, T * HS,
+                                                att, T, T * T,
+                                                &beta,
+                                                vaccum, HS, T * HS,
+                                                B * NH
+    );
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = ceil_div(B * T * C, block_size);
+    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        unpermute_kernel(id, vaccum, out, B, T, NH, HS);
+    }).wait();
+}
+
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        sycl::queue &q,
@@ -480,6 +748,12 @@ void attention_forward(int kernel_num,
             break;
         case 2:
             attention_forward2(q, out, inp, B, T, C, NH, block_size);
+            break;
+        case 3:
+            attention_forward3(q, out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 4:
+            attention_forward4(q, out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
         default:
             std::cout << "Invalid kernel number\n";
