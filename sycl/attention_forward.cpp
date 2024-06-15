@@ -3,7 +3,11 @@
 #include <iostream>
 #include <cmath>
 #include <cstdlib>
+
+#define ENABLE_BF16
 #include "common.hpp"
+
+static bool first_run_validation = true; // always run e.g. permute on 1st run
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -479,6 +483,112 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     }
 }
 
+// --- Forward 5 & 6 kernels ---
+void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_temperature,
+                                  const floatX* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    sycl::sub_group warp = id.get_sub_group();
+    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const floatX* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    // Same thing but without float4, one at a time
+    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = sycl::fmax(maxval, (float)x[4*i + k]);
+        }
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += sycl::exp(inv_temperature * ((float)x[4*i + k] - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = sycl::fmax(maxval, (float)x[4*pos_by_4 + warp.get_local_linear_id()]);
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        sumval += sycl::exp(inv_temperature * ((float)x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+    }
+
+    float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>());
+    sumval *= sycl::exp(inv_temperature * (maxval - global_maxval));
+
+    float sum = sycl::reduce_over_group(warp, sumval, sycl::plus<float>());
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+        // recalculation is faster than doing the round-trip through memory.
+        // Fix this later
+        //float ev = sycl::exp(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
+        //__stcs(out + idx * T + i, (floatX)(ev * norm));
+        float ev = sycl::exp(inv_temperature * ((float)x[i] - global_maxval));
+        out[idx * T + i] = (floatX)(ev * norm);
+    }
+}
+
+void permute_kernel_lowp(sycl::nd_item<1> id, floatX* q, floatX* k, floatX* v,
+                         const float* inp,
+                         int B, int N, int NH, int d) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+    int idx = id.get_global_id(0);
+
+    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = \
+            (b * N * 3 * NH * d)
+            +   (n * 3 * NH * d)
+            +       (0 * NH * d)
+            +          (nh_ * d)
+            +                d_;
+
+        q[idx] = (floatX)inp[inp_idx];
+        k[idx] = (floatX)inp[inp_idx + NH * d];
+        v[idx] = (floatX)inp[inp_idx + 2 * (NH * d)];
+    }
+}
+
+void unpermute_kernel_lowp(sycl::nd_item<1> id, const floatX* inp, float *out, int B, int N, int NH, int d) {
+    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    int idx = id.get_global_id(0);
+
+    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        out[other_idx] = (float)inp[idx];
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -733,6 +843,80 @@ void attention_forward4(sycl::queue &queue, float* out, float* vaccum, float* qk
     }).wait();
 }
 
+void attention_forward5(sycl::queue &queue, float* out, floatX* vaccum, floatX* qkvr, floatX* preatt, floatX* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size, bool skip_permute=false){
+    // FP16 version of kernel 4 (with permute/unpermute doing FP32<->FP16)
+    // That permute can be skipped on perf runs to analyse its performance impact
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    int HS = C / NH; // head size
+    floatX *q = qkvr + 0 * B * T * C;
+    floatX *k = qkvr + 1 * B * T * C;
+    floatX* v = qkvr + 2 * B * T * C;
+
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    if (!skip_permute || first_run_validation) {
+        queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+            permute_kernel_lowp(id, q, k, v, inp, B, T, NH, HS);
+        }).wait();
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const floatX alpha_lowp = (floatX)alpha;
+    const floatX beta_lowp = (floatX)beta;
+
+    // batched matrix multiply with cuBLAS
+    auto trans = oneapi::mkl::transpose::trans;
+    auto no_trans = oneapi::mkl::transpose::nontrans;
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                trans, no_trans,
+                                                T, T, HS,
+                                                alpha_lowp,
+                                                k, HS, T * HS,
+                                                q, HS, T * HS,
+                                                beta_lowp,
+                                                preatt, T, T * T,
+                                                B * NH
+    );
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0f / sqrtf(HS);
+    int softmax_block_size = 256;
+    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    queue.parallel_for(sycl::nd_range<1>(grid_size * softmax_block_size, softmax_block_size), [=](sycl::nd_item<1> id) {
+        softmax_forward_kernel5_lowp(id, att, scale, preatt, B * NH, T);
+    }).wait();
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    oneapi::mkl::blas::column_major::gemm_batch(queue,
+                                                no_trans, no_trans,
+                                                HS, T, T,
+                                                alpha_lowp,
+                                                v, HS, T * HS,
+                                                att, T, T * T,
+                                                beta_lowp,
+                                                vaccum, HS, T * HS,
+                                                B * NH
+    );
+
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = ceil_div(B * T * C, block_size);
+    if(!skip_permute || first_run_validation) {
+        queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+            unpermute_kernel_lowp(id, vaccum, out, B, T, NH, HS);
+        }).wait();
+    }
+}
+
 
 // kernel version dispatch
 void attention_forward(int kernel_num,
@@ -754,6 +938,16 @@ void attention_forward(int kernel_num,
             break;
         case 4:
             attention_forward4(q, out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 5:
+            attention_forward5(q, out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
+                               inp, B, T, C, NH, block_size, false);
+            break;
+        case 6: // skip permutes for perf passes (to analyse perf as if in/out were truly 16-bit)
+            attention_forward5(q, out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
+                               inp, B, T, C, NH, block_size, true);
             break;
         default:
             std::cout << "Invalid kernel number\n";
@@ -816,6 +1010,7 @@ int main(int argc, char **argv) {
         }
     }
     std::cout << "All results match. Starting benchmarks." << std::endl;
+    first_run_validation = false;
 
     // benchmark speed of the kernel
     for (int block_size: block_sizes) {
