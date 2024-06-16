@@ -533,6 +533,77 @@ void softmax_autoregressive_backward_kernel5(sycl::nd_item<2> id,
     }
 }
 
+// I want `BlockSize` to be statically known to the compiler, thus we get a template here.
+// This kernel takes a step back, and looks at the original CPU code again. We have some simple outer loops
+// That are independent, (b, t, h), and then the inner loops over (t2, t3) where we're combining elements -- this is
+// where we can reuse data and be more efficient
+// => handle b, t, h  through block indices; each block does all the work for the (t2, t3) loop cooperatively.
+// Now we have two nested loops, and in the inner instruction, we combine indexing from both => this calls for
+// loop tiling, and lifting some of the memory ops out of the loop.
+// We're in luck here;  if we tile so that t3 is the outer loop, we can get a sinlge write op per result, AND also cache
+// the t2-indexed part of the computation, which is the problematic one because it contains a multiplication that now we
+// do not have to repeat over and over.
+// => do an outer t3 loop where each thread gets one t3 index. Then, do an outer t2 loop in steps of BlockSize, and
+// prepare BlockSize many elements for the inner loop. Here, each thread calculates one element and stores it in shmem.
+// Then, in the inner t2 loop, each thread reads *all* the elements previously stored and does its computations.
+// This way, we do 3*BlockSize loads, but BlockSize^2 computation steps => This kernel is now entirely compute bound.
+// To fix up the compute issues, as above, we replace ifs in memory reading with min, and also split the inner loop
+// into a large region where we don't have to calculate the indicator, and a small, costly region where we do.
+template<int BlockSize>
+void softmax_autoregressive_backward_kernel6(sycl::nd_item<2> id,
+                                             float* att_bth_s,
+                                             float* dpreatt, const float* datt, const float* att,
+                                             int B, int T, int C, int NH) {
+    sycl::group block = id.get_group();
+
+    int idx = id.get_group(0);
+    int t = id.get_group(1);
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+    const float* att_bth = att + t * T;
+    const float* datt_bth = datt + t * T;
+    float* dpreatt_bth = dpreatt + t * T;
+
+    int block_steps = ceil_div(t+1, BlockSize);
+    // very important: This loop condition needs to be the same for all threads.
+    // even if a thread later on is not going to do any work, it needs to participate in the
+    // data loading process!
+    for (int t3f = 0; t3f < block_steps; ++t3f) {
+        int t3 = t3f * BlockSize + block.get_local_linear_id();
+        float acc = 0.f;
+        float at3 = att_bth[t3];
+        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
+            int end = sycl::min(t + 1 - t2b, BlockSize);
+            sycl::group_barrier(block);
+            {
+                int t2i = block.get_local_linear_id();
+                int t2 = sycl::min(t, t2b + t2i);
+                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
+            }
+
+            sycl::group_barrier(block);
+            if(t3f * BlockSize == t2b) {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    int t2 = t2b + t2i;
+                    float indicator = t2 == t3 ? 1.0f : 0.0f;
+                    acc += att_bth_s[t2i] * (indicator - at3);
+                }
+            } else {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    acc +=  att_bth_s[t2i] * (0.f - at3);
+                }
+            }
+        }
+        dpreatt_bth[t3] = scale * acc;
+    }
+}
+
+
 // Actually disentangling the loops and simplifying the resulting math gives us this pretty nice kernel.
 template<int BlockSize>
 void softmax_autoregressive_backward_kernel7(sycl::nd_item<2> id,
@@ -569,13 +640,12 @@ void softmax_autoregressive_backward_kernel7(sycl::nd_item<2> id,
 //  - multiple values of T per block
 template<int BlockSize>
 void softmax_autoregressive_backward_kernel8(sycl::nd_item<2> id,
-                                             sycl::multi_ptr<float[32], sycl::access::address_space::local_space> l_mem_ptr,
+                                             float* block_acc,
                                              float* dpreatt, const float* datt, const float* att,
                                              int B, int T, int C, float scale) {
     constexpr int T_per_block = 4;
     sycl::group block = id.get_group();
     sycl::sub_group warp = id.get_sub_group();
-    float* block_acc = (float*) l_mem_ptr.get_raw();
 
     int idx = id.get_group(0);
     // go through blocks in reverse order, so the slowest block starts first
@@ -755,6 +825,54 @@ void dispatch_launch(Launcher&& launch, int block_size) {
     }
 }
 
+void launch_softmax_6(sycl::queue &q, float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+
+        sycl::range<2> block_size_range(1, block_size);
+        sycl::range<2> num_blocks_range(B * NH, T);
+        sycl::nd_range<2> grid(num_blocks_range * block_size_range, block_size_range);
+        q.parallel_for(grid, [=](sycl::nd_item<2> id) [[sycl::reqd_work_group_size(1, block_size)]]{
+            auto l_mem_ptr = (float*)sycl::ext::oneapi::group_local_memory_for_overwrite<float[block_size]>(
+                    id.get_group()).get_raw();
+            softmax_autoregressive_backward_kernel6<block_size>(id, l_mem_ptr, dpreatt, datt, att, B, T, C, NH);
+        });
+    };
+    dispatch_launch(launch, block_size);
+}
+
+void launch_softmax_7(sycl::queue &q, float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        sycl::range<2> block_size_range(1, int_const.value);
+        sycl::range<2> num_blocks_range(B * NH, T);
+        sycl::nd_range<2> grid(num_blocks_range * block_size_range, block_size_range);
+        q.parallel_for(grid, [=](sycl::nd_item<2> id) {
+            softmax_autoregressive_backward_kernel7<block_size>(id, dpreatt, datt, att, B, T, C, scale);
+        });
+    };
+    dispatch_launch(launch, block_size);
+}
+
+void launch_softmax_8(sycl::queue &q, float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        sycl::range<2> block_size_range(1, int_const.value);
+        sycl::range<2> num_blocks_range(B * NH, T / 4);
+        sycl::nd_range<2> grid(num_blocks_range * block_size_range, block_size_range);
+        q.parallel_for(grid, [=](sycl::nd_item<2> id) {
+            auto l_mem_ptr = (float*)sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
+                    id.get_group()).get_raw();
+            softmax_autoregressive_backward_kernel8<block_size>(id, l_mem_ptr, dpreatt, datt, att, B, T, C, scale);
+        });
+    };
+    dispatch_launch(launch, block_size);
+}
+
 
 
 
@@ -848,37 +966,6 @@ void attention_backward1(sycl::queue &queue, float* dinp, float* dqkvr, float* d
     }).wait();
 }
 
-void launch_softmax_7(sycl::queue &q, float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    auto launch = [&](auto int_const) {
-        constexpr int block_size = int_const.value;
-        sycl::range<2> block_size_range(1, int_const.value);
-        sycl::range<2> num_blocks_range(B * NH, T);
-        sycl::nd_range<2> grid(num_blocks_range * block_size_range, block_size_range);
-        q.parallel_for(grid, [=](sycl::nd_item<2> id) {
-            softmax_autoregressive_backward_kernel7<block_size>(id, dpreatt, datt, att, B, T, C, scale);
-        });
-    };
-    dispatch_launch(launch, block_size);
-}
-
-void launch_softmax_8(sycl::queue &q, float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    auto launch = [&](auto int_const) {
-        constexpr int block_size = int_const.value;
-        sycl::range<2> block_size_range(1, int_const.value);
-        sycl::range<2> num_blocks_range(B * NH, T / 4);
-        sycl::nd_range<2> grid(num_blocks_range * block_size_range, block_size_range);
-        q.parallel_for(grid, [=](sycl::nd_item<2> id) {
-            auto l_mem_ptr = sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(id.get_group());
-            softmax_autoregressive_backward_kernel8<block_size>(id, l_mem_ptr, dpreatt, datt, att, B, T, C, scale);
-        });
-    };
-    dispatch_launch(launch, block_size);
-}
-
 
 // kernel version dispatch
 void attention_backward(int kernel_num,
@@ -910,8 +997,9 @@ void attention_backward(int kernel_num,
                                 launch_softmax_5, block_size);
             break;
         case 6:
-            std::cout << "TODO: port version 6";
-            exit(1);
+            attention_backward1(q, dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_6, block_size);
+            break;
         case 7:
             attention_backward1(q, dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_7, block_size);
