@@ -149,8 +149,7 @@ template<class D, class T>
 void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance = 1e-4) {
     sycl::queue q(sycl::default_selector_v);
 
-    // Allocate host memory using SYCL
-    D* out_gpu = sycl::malloc_host<D>(num_elements * sizeof(D), q);
+    D* out_gpu = (D*)malloc(num_elements * sizeof(D));
 
     // Copy results from device to host
     q.memcpy(out_gpu, device_result, num_elements * sizeof(D)).wait();
@@ -182,18 +181,18 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
             std::cerr << "Mismatch of " << name << " at " << i << ": CPU_ref: " << cpu_reference[i] << " vs GPU: " << static_cast<T>(out_gpu[i]) << std::endl;
             nfaults++;
             if (nfaults >= 10) {
-                sycl::free(out_gpu, q);
+                free(out_gpu);
                 std::exit(EXIT_FAILURE);
             }
         }
     }
 
     if (nfaults > 0) {
-        sycl::free(out_gpu, q);
+        free(out_gpu);
         std::exit(EXIT_FAILURE);
     }
 
-    sycl::free(out_gpu, q);
+    free(out_gpu);
 }
 
 template<class Kernel, class... KernelArgs>
