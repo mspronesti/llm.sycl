@@ -120,7 +120,7 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
     for(int c = 0; c < C; ++c) {
         float out = (float)inp1[c] + (float)inp2[c];
         m += out;
-        residual[c] = out;
+        residual[c] = (floatX)out;
     }
 
     m = m / C;
@@ -136,11 +136,11 @@ void fused_residual_forward_kernel2(sycl::nd_item<1> item, floatX* residual, flo
     for (int c = 0; c < C; c++) {
         float n = (s * ((float)residual[c] - m)); // normalized output
         float o = n * (float)weight[c] + (float)bias[c]; // scale and shift it
-        normed[c] = o; // write
+        normed[c] = (floatX)o; // write
     }
     // cache the mean and rstd for the backward pass later
-    mean[idx] = m;
-    rstd[idx] = s;
+    mean[idx] = (floatX)m;
+    rstd[idx] = (floatX)s;
 }
 
 void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
@@ -195,6 +195,158 @@ void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, flo
     }
 }
 
+
+void fused_residual_forward_kernel4(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                    const floatX* inp1, const floatX* inp2,
+                                    const floatX* weight, const floatX* bias,
+                                    int N, int C) {
+    using x128 = Packed128<floatX>;
+    constexpr const int WarpSize = 32;
+
+    int idx = item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
+    if(idx > N) return;
+
+    auto sg = item.get_sub_group();
+    int thread_id = item.get_local_id(1);
+
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    int c = thread_id * x128::size;
+    for(; c < C; c += WarpSize * x128::size) {
+        const x128 in1 = load128cs(inp1 + c);
+        const x128 in2 = load128cs(inp2 + c);
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
+            sum += (float)out[k];
+            sum_sq += (float)out[k] * (float)out[k];
+        }
+        store128(residual + c, out);
+    }
+
+    sum =  sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+    sum_sq =  sycl::reduce_over_group(sg, sum_sq, sycl::plus<float>());
+
+
+    float m = sum / C;
+    float v = sum_sq / C - m * m;
+    float s = sycl::rsqrt(v + eps);
+
+    c -= WarpSize * x128::size;
+    for(; c >= 0; c -= WarpSize * x128::size) {
+        const x128 res = load128cs(residual + c);
+        const x128 w = load128(weight + c);
+        const x128 b = load128(bias + c);
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)res[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out[k] = o;
+        }
+
+        store128cs(normed + c, out);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(thread_id == 0) {
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
+}
+
+// what do you want in shared memory? EVERYTHING!
+// thus, we no longer require zigzag loops and can do the numerically more stable variance estimation
+// needs special attention in the kernel launcher to ensure we have enough smem.
+void fused_residual_forward_kernel5(sycl::nd_item<2> item, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                               const floatX* inp1, const floatX* inp2,
+                                               const floatX* weight, const floatX* bias,
+                                               int N, int C,
+                                               sycl::local_accessor<char, 1> local_acc) {
+    constexpr const int WarpSize = 32;
+
+    auto sg = item.get_sub_group();
+    int threadIdx_x = item.get_local_id(1);
+    int threadIdx_y = item.get_local_id(0);
+
+    // load weights and biases into shared memory
+    // do this before we allow any threads to exit!
+    auto params = (char *)local_acc.get_multi_ptr<sycl::access::decorated::no>().get();
+    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
+    // let's keep everything as x128
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx_x) * C / x128::size);
+
+    int sidx = (threadIdx_x + WarpSize * threadIdx_y) * x128::size;
+    for(int i = sidx; i < C; i += item.get_local_range(0) * WarpSize * x128::size) {
+        s_weight[i/x128::size] = load128(weight + i);
+        s_bias[i/x128::size] = load128(bias + i);
+    }
+    item.barrier();
+
+    int idx = item.get_group(0) * item.get_local_range(0) + threadIdx_y;
+    if(idx > N) return;
+
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in1 = load128cs(inp1 + c);
+        const x128 in2 = load128cs(inp2 + c);
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
+            sum += (float)out[k];
+        }
+        store128cs(residual + c, out);
+        s_res[c / x128::size] = out;
+    }
+
+    sum =  sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+    float m = sum / C;
+    float v = 0.f;
+
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        for(int k = 0; k < x128::size; ++k) {
+            v += ((float)res[k] - m) * ((float)res[k] - m);
+        }
+    }
+
+    v = sycl::reduce_over_group(sg, v, sycl::plus<float>()) / C;
+    float s = sycl::rsqrt(v + eps);
+
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        const x128 w = s_weight[c / x128::size];
+        const x128 b = s_bias[c / x128::size];
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)res[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out[k] = o;
+        }
+
+        store128cs(normed + c, out);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(threadIdx_x == 0) {
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 void fused_residual_forward1(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
@@ -238,6 +390,48 @@ void fused_residual_forward3(sycl::queue &q, floatX* residual, floatX* normed, f
     }).wait();
 }
 
+void fused_residual_forward4(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C, const int block_size) {
+    int block_y = block_size / 32;
+    int grid_size = ceil_div(N, block_y);
+    sycl::nd_range<2> grid = sycl::nd_range<2>(
+            sycl::range<2>(grid_size * block_y, 32),
+            sycl::range<2>(block_y, 32)
+    );
+
+    q.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]]{
+        fused_residual_forward_kernel4(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+    }).wait();
+}
+
+// this doesn't work :(
+void fused_residual_forward5(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C, const int block_size) {
+    int block_y = block_size / 32;
+    int grid_size = ceil_div(N, block_y);
+    size_t smem = (2 + block_y) * C * sizeof(floatX);
+
+    sycl::nd_range<2> grid = sycl::nd_range<2>(
+            sycl::range<2>(grid_size * block_y, 32),
+            sycl::range<2>(block_y, 32)
+    );
+
+    q.submit([&](sycl::handler &h) {
+        sycl::local_accessor<char, 1> local_acc(
+                sycl::range<1>(smem), h
+        );
+
+        h.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]]{
+            fused_residual_forward_kernel5(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, local_acc);
+        });
+
+    }).wait();
+}
+
 // kernel version dispatch
 void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                             const floatX* inp1, const floatX* inp2,
@@ -253,6 +447,12 @@ void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, fl
         case 3:
             fused_residual_forward3(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
             break;
+        case 4:
+            fused_residual_forward4(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
+            break;
+/*        case 5:
+            fused_residual_forward5(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
+            break;*/
         default:
             std::cout << "Invalid kernel number\n";
             std::exit(1);
