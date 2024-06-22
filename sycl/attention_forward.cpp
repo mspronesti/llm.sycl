@@ -534,9 +534,6 @@ void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_te
     // divide the whole row by the sum
     for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
         // recalculation is faster than doing the round-trip through memory.
-        // Fix this later
-        //float ev = sycl::exp(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        //__stcs(out + idx * T + i, (floatX)(ev * norm));
         float ev = sycl::exp(inv_temperature * ((float)x[i] - global_maxval));
         out[idx * T + i] = (floatX)(ev * norm);
     }

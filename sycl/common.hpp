@@ -34,7 +34,6 @@ struct alignas(16) Packed128 {
     sycl::int4 get_bits() const {
         sycl::int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        // Fix this later
         bits = *reinterpret_cast<const sycl::int4*>(payload);
         return bits;
     }

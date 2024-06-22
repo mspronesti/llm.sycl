@@ -432,6 +432,25 @@ void fused_residual_forward5(sycl::queue &q, floatX* residual, floatX* normed, f
     }).wait();
 }
 
+void fused_residual_forward6(sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C, const int block_size) {
+    int warps_per_token = std::max(1, C / Packed128<floatX>::size / 32);
+    int total_warps = block_size / 32;
+    const int grid_size = ceil_div(N, total_warps);
+
+    sycl::nd_range<2> grid = sycl::nd_range<2>(
+            sycl::range<2>(grid_size * total_warps, 32),
+            sycl::range<2>(total_warps, 32)
+    );
+
+    q.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]]{
+        fused_residual_forward_kernel4(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+    }).wait();
+
+}
+
 // kernel version dispatch
 void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                             const floatX* inp1, const floatX* inp2,
@@ -453,6 +472,9 @@ void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, fl
 /*        case 5:
             fused_residual_forward5(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
             break;*/
+        case 6:
+            fused_residual_forward6(q, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, block_size);
+            break;
         default:
             std::cout << "Invalid kernel number\n";
             std::exit(1);
@@ -460,6 +482,8 @@ void fused_residual_forward(int kernel_num, sycl::queue &q, floatX* residual, fl
 }
 
 int main(int argc, const char **argv) {
+    srand(0);
+
     int B = 8;
     int T = 1024;
     int C = 768;
