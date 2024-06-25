@@ -42,7 +42,7 @@ void gelu_backward_kernel1(sycl::nd_item<1> id, floatX* dinp, const floatX* inp,
 }
 
 void gelu_backward_kernel2(sycl::nd_item<1> id,  floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
-    int i = id.get_global_id(0);
+    int i = id.get_global_id(0) * x128::size;
     if (i < N) {
         x128 packed_dinp;
         x128 packed_inp = load128cs(inp + i);
@@ -105,24 +105,16 @@ void gelu_backward(int kernel_num,
 // Main function
 
 int main(int argc, char** argv) {
+    srand(0);
     int B = 8;
     int T = 1024;
     int C = 768;
-    int N = B * T * C;
 
     // Create host memory of random numbers
-    float* dinp = new float[N];
-    float* inp = make_random_float(N);
-    float* dout = make_random_float(N);
+    float* dinp = new float[B * T * C];
+    float* inp = make_random_float(B * T * C);
+    float* dout = make_random_float(B * T * C);
 
-    // SYCL queue
-    sycl::queue q(sycl::default_selector_v);
-    auto d_dinp = sycl::malloc_device<floatX>(B * T * C, q);
-    auto d_inp = sycl::malloc_device<floatX>(B * T * C, q);
-    auto d_dout = sycl::malloc_device<floatX>(B * T * C, q);
-
-    memcpy_convert(d_inp, inp, B * T * C, q);
-    memcpy_convert(d_dout, dout, B * T * C, q);
 
     // Read kernel_num from command line
     int kernel_num = 1;
@@ -132,7 +124,16 @@ int main(int argc, char** argv) {
     std::cout << "Using kernel " << kernel_num << std::endl;
 
     // First check the correctness of the kernel
-    gelu_backward_cpu(dinp, inp, dout, N);
+    gelu_backward_cpu(dinp, inp, dout, B * T * C);
+
+    // move to GPU
+    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
+    auto d_dinp = sycl::malloc_device<floatX>(B * T * C, q);
+    auto d_inp = sycl::malloc_device<floatX>(B * T * C, q);
+    auto d_dout = sycl::malloc_device<floatX>(B * T * C, q);
+
+    memcpy_convert(d_inp, inp, B * T * C, q);
+    memcpy_convert(d_dout, dout, B * T * C, q);
 
     // Time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512};
@@ -144,7 +145,7 @@ int main(int argc, char** argv) {
 #else
         float tol = 1e-2f;
 #endif
-        validate_result(dinp, dinp, "dinp", N, 1e-5f);
+        validate_result(d_dinp, dinp, "dinp", B * T * C, tol);
     }
 
     std::cout << "All results match. Starting benchmarks.\n\n";
