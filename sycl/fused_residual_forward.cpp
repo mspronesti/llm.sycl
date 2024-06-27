@@ -536,14 +536,21 @@ void fused_residual_forward5(sycl::queue &q, floatX* residual, floatX* normed, f
             sycl::range<2>(block_y, 32)
     );
 
-    q.submit([&](sycl::handler &h) {
-        sycl::local_accessor<char> local_acc(smem, h);
-        h.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]] {
-            fused_residual_forward_kernel5(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C,
-                                           local_acc);
+    auto local_mem = q.get_device().get_info<sycl::info::device::local_mem_size>();
+    if (local_mem > smem) {
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<char> local_acc(smem, h);
+            h.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]] {
+                fused_residual_forward_kernel5(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, local_acc);
+            });
         });
-
-    }).wait();
+    } else {
+        std::cout << "Not enough unified shared memory, falling back to kernel 4\n";
+        q.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]] {
+            fused_residual_forward_kernel4(item, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C);
+        });
+    }
+    q.wait();
 }
 
 
@@ -573,6 +580,7 @@ void fused_residual_forward6(sycl::queue &q, floatX* residual, floatX* normed, f
             });
         });
     } else {
+        std::cout << "Not enough unified shared memory, falling back to kernel 4\n";
         // fallback on kernel 4
         const int grid_size = ceil_div(N, total_warps);
         sycl::nd_range<2> grid = sycl::nd_range<2>(
