@@ -98,13 +98,14 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 
 // ----------------------------------------------------------------------------
 // GPU kernels
-
-void atomicAdd(float* addr, float val) {
-    sycl::atomic_ref<float,
-            sycl::memory_order::relaxed,
-            sycl::memory_scope::device> ref(*addr);
-    ref += val;
+template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
+static inline T atomicAdd(T* val, const T delta)
+{
+  sycl::atomic_ref<T, sycl::memory_order::relaxed,
+     MemoryScope> ref(*val);
+  return ref.fetch_add(delta);
 }
+
 
 // super naive kernel that just parallelizes over B,T and loops over C
 void layernorm_backward_kernel1(sycl::nd_item<1> id, float* dinp, float* dweight, float* dbias,
@@ -151,6 +152,88 @@ void layernorm_backward_kernel1(sycl::nd_item<1> id, float* dinp, float* dweight
     }
 }
 
+// uses shared memory instead for the reduces
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward_kernel2(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                                           const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                                           int B, int T, int C, float* dweight_tmp, float* dbias_tmp, sycl::local_accessor<float> local_acc) {
+    auto shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C
+
+    auto warp = id.get_sub_group();
+    int warp_size = warp.get_max_local_range()[0];
+
+    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int N = B * T;
+    if(idx >= N) { return; } // thread guards
+
+    int b = idx / T;
+    int t = idx % T;
+
+    const Tdout* dout_bt = dout + b * T * C + t * C;
+    const Trest* inp_bt = inp + b * T * C + t * C;
+    Tdinp* dinp_bt = dinp + b * T * C + t * C;
+    const float mean_bt = (float)mean[b * T + t];
+    const float rstd_bt = (float)rstd[b * T + t];
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+#pragma unroll
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)){
+        dbias_shared[i] = 0.0f;
+        dweight_shared[i] = 0.0f;
+    }
+    id.barrier();
+
+    // first: two reduce operations
+    float dnorm_mean = 0.0f;
+    float dnorm_norm_mean = 0.0f;
+    for (int i = warp.get_local_linear_id(); i < C; i  += warp_size) {
+        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+        dnorm_mean += dnorm_i;
+        dnorm_norm_mean += dnorm_i * norm_bti;
+    }
+    dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
+    dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
+    dnorm_mean = dnorm_mean / C;
+    dnorm_norm_mean = dnorm_norm_mean / C;
+
+    // now iterate again and accumulate all the gradients
+    for (int i = warp.get_local_linear_id(); i < C; i += warp_size) {
+        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+        // gradient contribution to bias
+        atomicAdd(&dbias_shared[i], (float)dout_bt[i]);
+        // gradient contribution to weight
+        atomicAdd(&dweight_shared[i], norm_bti * (float)dout_bt[i]);
+        // gradient contribution to input
+        float dval = 0.0f;
+        dval += dnorm_i; // term 1
+        dval -= dnorm_mean; // term 2
+        dval -= norm_bti * dnorm_norm_mean; // term 3
+        dval *= rstd_bt; // final scale
+        dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+    }
+    id.barrier();
+
+    // write to global memory
+   for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+        atomicAdd(&dbias_tmp[i], dbias_shared[i]);
+        atomicAdd(&dweight_tmp[i], dweight_shared[i]);
+    }
+}
+
+template <typename Tparams>
+void copy_to_dweight_dbias(sycl::nd_item<1> id, int C, Tparams* dbias, Tparams* dweight, float* dbias_tmp, float* dweight_tmp) {
+    for (int i = id.get_local_id(0); i < C; i += id.get_local_range(0) * id.get_group_range(0)) {
+        dbias[i] = (Tparams)dbias_tmp[i];
+        dweight[i] = (Tparams)dweight_tmp[i];
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -164,6 +247,39 @@ void layernorm_backward1(sycl::queue &q, float* dinp, float* dweight, float* dbi
     });
 }
 
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward2(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+    const int N = B * T;
+    const int grid_size = ceil_div(32*N, block_size);
+    size_t shared_mem_size = 2 * C * sizeof(float);
+    float* dweight_tmp;
+    float* dbias_tmp;
+
+    dweight_tmp = sycl::malloc_device<float>(C, q);
+    dbias_tmp = sycl::malloc_device<float>(C, q);
+
+    q.memset(dweight_tmp, 0, C * sizeof(float));
+    q.memset(dbias_tmp, 0, C * sizeof(float));
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> local_acc(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) [[sycl::reqd_sub_group_size(32)]] {
+            layernorm_backward_kernel2(id, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp, local_acc);
+        });
+    });
+
+    q.parallel_for(sycl::nd_range<1>(512, 512), [=](sycl::nd_item<1> id) {
+        copy_to_dweight_dbias(id, C, dbias, dweight, dbias_tmp, dweight_tmp);
+    });
+
+    q.wait();
+
+    sycl::free(dweight_tmp, q);
+    sycl::free(dbias_tmp, q);
+}
+
 // kernel version dispatch
 void layernorm_backward(int kernel_num, sycl::queue &q,
                         floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -173,6 +289,9 @@ void layernorm_backward(int kernel_num, sycl::queue &q,
     switch (kernel_num) {
         case 1:
             layernorm_backward1(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 2:
+            layernorm_backward2(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         default:
             std::cout << "Invalid kernel number\n";
