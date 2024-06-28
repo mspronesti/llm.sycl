@@ -1,10 +1,10 @@
 #ifndef LLM_SYCL_SYCL_UTILS_HPP
 #define LLM_SYCL_SYCL_UTILS_HPP
 
-#include <sycl_common.hpp>
+#include "sycl_common.hpp"
 
 // ----------------------------------------------------------------------------
-// Packed128 data structure, which forces the compiler to use 128-bit loads/stores
+// Packed128 data structure that forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
 // supports arbitrary precision.
@@ -15,7 +15,23 @@ struct alignas(16) Packed128 {
 
     explicit Packed128(sycl::int4 bits) {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        *reinterpret_cast<sycl::int4*>(payload) = bits;
+        memcpy(&payload, &bits, sizeof(bits));
+    }
+
+    static Packed128 constant(ElementType value) {
+        Packed128 result;
+        for(int k = 0; k < size; ++k) {
+            result.payload[k] = value;
+        }
+        return result;
+    }
+
+    static Packed128 zeros() {
+        return constant(0.f);
+    }
+
+    static Packed128 ones() {
+        return constant(1.f);
     }
 
     ElementType& operator[](int index) {
@@ -29,16 +45,14 @@ struct alignas(16) Packed128 {
     sycl::int4 get_bits() const {
         sycl::int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        bits = *reinterpret_cast<const sycl::int4*>(payload);
+        memcpy(&bits, &payload, sizeof(bits));
         return bits;
     }
 
-    // e.g. sizeof(int4) is 16 (4 X 4 bytes), sizeof(bfloat16) = 2, so size = 8
-    // so in the case where ElementType = bfloat16, we store 8 elements in one Packed128
+
     static constexpr const int size = sizeof(sycl::int4) / sizeof(ElementType);
     ElementType payload[size];
 };
-
 
 // load a Packed128 from an aligned memory address
 template<class ElementType>
@@ -57,15 +71,19 @@ template<class ElementType>
 void store128(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
 }
-
 // store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 void store128cs(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
 }
 
+// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
+template<class ElementType>
+void store128cg(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
+}
 
-// short-form typedef
+// short-form typedefs
 typedef Packed128<float> f128;
 typedef Packed128<floatX> x128;
 
@@ -150,7 +168,7 @@ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
 inline void stochastic_rounding(sycl::nd_item<2> id, float in, sycl::ext::oneapi::bfloat16 *out, unsigned int seed) {
     // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(threadIdx_x(id), blockIdx_x(id) * blockDim_x(id) + blockIdx_y(id), seed);
+    unsigned int random = Get2dNoiseUint(id.get_local_id(1), id.get_group(1) * id.get_local_range(1) + id.get_group(0), seed);
     unsigned int threshold = random & 0xFFFF;
     unsigned int float_bits =  *reinterpret_cast<unsigned int*>(&in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
