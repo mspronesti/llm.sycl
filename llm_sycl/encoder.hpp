@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "sycl_common.h"
+#include "sycl_common.hpp"
 #include "sycl_utils.hpp"
 
 // ----------------------------------------------------------------------------
@@ -103,7 +103,7 @@ void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
     sycl::group_barrier(id.get_group());
 
     // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
-    for (int i = threadIdx_x+WARP_SIZE; i < sycl::min(BLOCK_SIZE, bucket_size*WARP_SIZE); i += WARP_SIZE) {
+    for (int i = threadIdx_x+WARP_SIZE; i < sycl::min(BLOCK_SIZE, bucket_size*(int)WARP_SIZE); i += WARP_SIZE) {
         for (int k = 0; k < x128::size; k++) {
             accum[k] += accum_shared[i + k * BLOCK_SIZE];
         }

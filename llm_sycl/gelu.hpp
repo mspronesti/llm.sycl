@@ -6,7 +6,7 @@
 
 
 #include <cassert>
-#include "sycl_common.h"
+#include "sycl_common.hpp"
 #include "sycl_utils.hpp"
 
 // ----------------------------------------------------------------------------

@@ -5,7 +5,7 @@ Global norm, used in gradient clipping
 #define LLM_SYCL_GLOBAL_NORM_HPP
 
 #include <cassert>
-#include "sycl_common.h"
+#include "sycl_common.hpp"
 #include "sycl_utils.hpp"
 
 // ----------------------------------------------------------------------------

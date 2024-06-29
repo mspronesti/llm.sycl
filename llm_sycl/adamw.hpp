@@ -1,7 +1,7 @@
 #ifndef LLM_SYCL_ADAMW_HPP
 #define LLM_SYCL_ADAMW_HPP
 
-#include "sycl_common.h"
+#include "sycl_common.hpp"
 #include "sycl_utils.hpp"
 
 // ----------------------------------------------------------------------------

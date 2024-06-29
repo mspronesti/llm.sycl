@@ -8,7 +8,7 @@ Fused Classifier:
 - (fusion) Also kicks off the backward pass, because everything is already loaded
 */
 
-#include "sycl_common.h"
+#include "sycl_common.hpp"
 #include "sycl_utils.hpp"
 
 struct SoftmaxParams {
