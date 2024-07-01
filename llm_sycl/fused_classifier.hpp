@@ -136,13 +136,13 @@ fused_classifier_kernel5(sycl::nd_item<1> id, floatX* logits, floatX* losses, fl
 
 // replaces logits with logit gradients
 template <typename Type>
-void fused_classifier(sycl::queue &q, Type* logits, Type* losses,
+void fused_classifier(sycl::queue *stream, Type* logits, Type* losses,
                       const float dloss, const int* targets,
                       int B, int T, int V, int P) {
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = N;
-    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         fused_classifier_kernel5(id, logits, losses, (floatX*)nullptr, dloss, targets, B, T, V, P);
     });
 }

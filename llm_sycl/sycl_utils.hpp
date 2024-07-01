@@ -130,6 +130,14 @@ inline float warpReduceMax(sycl::sub_group warp, float val) {
     return sycl::reduce_over_group(warp, val, sycl::maximum<float>{});
 }
 
+float shuffle_down(sycl::sub_group warp, float val, int delta, int width) {
+    int id = warp.get_local_id();
+    int subid = id % width;
+    float result = sycl::shift_group_left(warp, val, delta);
+    if (subid + delta >= width)
+        result = val;
+    return result;
+}
 
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding

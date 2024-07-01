@@ -50,22 +50,22 @@ void gelu_backward_inplace_kernel(sycl::nd_item<1> id, floatX* d_in_out, const f
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(sycl::queue &q, floatX* out, const floatX* inp, int N) {
+void gelu_forward(sycl::queue *stream, floatX* out, const floatX* inp, int N) {
     const int block_size = 512;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         gelu_forward_kernel2(id, out, inp);
-    });
+    }).wait();
 }
 
-void gelu_backward_inplace(sycl::queue &q, floatX* d_in_out, const floatX* inp, const int N) {
+void gelu_backward_inplace(sycl::queue *stream, floatX* d_in_out, const floatX* inp, const int N) {
     const int block_size = 128;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         gelu_backward_inplace_kernel(id, d_in_out, inp);
-    });
+    }).wait();
 }
 
 #endif //LLM_SYCL_GELU_HPP

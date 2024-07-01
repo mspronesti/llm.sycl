@@ -54,11 +54,10 @@ void global_norm_aggregate_kernel(sycl::nd_item<1> id, float* out, size_t grid_s
 // kernel launcher
 
 // Helper function determines the maximum number of block sums
-int get_max_num_block_sums(sycl::queue &q, int* num_slices_all, int numel) {
+int get_max_num_block_sums(sycl::queue *stream, int* num_slices_all, int numel) {
     // NOTE: this needs to be kept in sync with `global_norm_squared` below.
     const int block_size = 512;
-    int grid_size = q.get_device().get_info<sycl::info::device::max_compute_units>();
-    grid_size *= WARP_SIZE;
+    int grid_size = stream->get_device().get_info<sycl::info::device::max_compute_units>() * WARP_SIZE;
     assert(grid_size > 0);
     int max_num_block_sums = 0;
     for (int i = 0; i < numel; i++) {
@@ -72,7 +71,7 @@ int get_max_num_block_sums(sycl::queue &q, int* num_slices_all, int numel) {
 }
 
 template<typename T>
-void global_norm_squared(sycl::queue &q, float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset) {
+void global_norm_squared(sycl::queue *stream, float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
@@ -80,7 +79,7 @@ void global_norm_squared(sycl::queue &q, float* out, const T* values, size_t cou
     // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
     // on all gpus, so the division really is going to be exact.
     //const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    const int grid_size = q.get_device().get_info<sycl::info::device::max_compute_units>() * WARP_SIZE / block_size;
+    const int grid_size = stream->get_device().get_info<sycl::info::device::max_compute_units>() * WARP_SIZE / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
 
     const int gx = CEIL_DIV(grid_size, num_slices);
@@ -89,21 +88,20 @@ void global_norm_squared(sycl::queue &q, float* out, const T* values, size_t cou
     assert(gx * gy < 1024);  // we want to later accumulate the block sums in a single block
 
     if (reset) {
-        q.memset(out, 0, max_num_block_sums * sizeof(float));
+        stream->memset(out, 0, max_num_block_sums * sizeof(float));
     }
     sycl::range<2> grid_dim(gy, gx);
     sycl::range<2> block_dim(1, block_size);
-    q.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
         global_norm_squared_kernel(id, out, values, count, stride);
-    });
+    }).wait();
 }
 
-void global_norm_squared_aggregate(sycl::queue &q, float* out, int max_num_block_sums) {
-    assert(max_num_block_sums > 0 && max_num_block_sums < 512);  // we need to accumulate the block sums in a single block
+void global_norm_squared_aggregate(sycl::queue *stream, float* out, int max_num_block_sums) {
     // important to use 512 here for determinism, otherwise blockreduce might introduce errors
-    q.parallel_for(sycl::nd_range<1>(512, 512), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(512, 512), [=](sycl::nd_item<1> id) {
         global_norm_aggregate_kernel(id, out, max_num_block_sums);
-    });
+    }).wait();
 }
 
 #endif //LLM_SYCL_GLOBAL_NORM_HPP

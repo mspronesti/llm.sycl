@@ -9,8 +9,9 @@
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
-inline float lerp(float start, float end, float weight) {
-    return sycl::mad(weight, end, sycl::mad(-weight, start, start));
+// Note: lerp is already present in the std library, renaming to sycl_lerp
+inline float sycl_lerp(float start, float end, float weight) {
+    return sycl::fma(weight, end, sycl::fma(-weight, start, start));
 }
 
 template <typename Tp, typename Tg>
@@ -25,10 +26,10 @@ void adamw_update(sycl::nd_item<2> id, Tp* params_memory, float* master_params_m
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)
-    m = lerp(grad, m, beta1);
+    m = sycl_lerp(grad, m, beta1);
     m_memory[idx] = m;
     // update the second moment (RMSprop)
-    v = lerp(grad * grad, v, beta2);
+    v = sycl_lerp(grad * grad, v, beta2);
     v_memory[idx] = v;
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat
@@ -49,18 +50,19 @@ void adamw_kernel3(sycl::nd_item<2> id, Tp* params_memory, float* master_params_
                    ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,
                    float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                    float grad_scale, unsigned int seed) {
-    adamw_update(id, params_memory + blockIdx_y(id) * w_stride,
-                 master_params_memory ? master_params_memory + blockIdx_y(id) * s_stride : NULL,
-                 grads_memory + blockIdx_y(id) * g_stride,
-                 m_memory + blockIdx_y(id) * s_stride,
-                 v_memory + blockIdx_y(id) * s_stride,
+    int blockIdx_y = id.get_group(0);
+    adamw_update(id, params_memory + blockIdx_y * w_stride,
+                 master_params_memory ? master_params_memory + blockIdx_y * s_stride : nullptr,
+                 grads_memory + blockIdx_y * g_stride,
+                 m_memory + blockIdx_y * s_stride,
+                 v_memory + blockIdx_y * s_stride,
                  num_parameters, learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale,
                  seed
     );
 }
 
 template <typename Tp, typename Tg>
-void adamw_update(sycl::queue &q, Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+void adamw_update(sycl::queue *stream, Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
                   float grad_scale, unsigned int seed) {
     // AdamW update
@@ -70,7 +72,7 @@ void adamw_update(sycl::queue &q, Tp* params_memory, float* master_params_memory
     float beta2_correction = 1.0f - powf(beta2, t);
     sycl::range<2> grid_dim(num_slices, num_blocks);
     sycl::range<2> block_dim(1, block_size);
-    q.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
         adamw_kernel3(id, params_memory, master_params_memory, grads_memory,
                       m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                       learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,

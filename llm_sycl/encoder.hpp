@@ -17,7 +17,7 @@
 void encoder_forward_kernel3(sycl::nd_item<1> id, floatX* out,
                              const int* inp, const floatX* wte, const floatX* wpe,
                              int B, int T, int C) {
-    int idx = (id.get_global_id(0)) * x128::size;
+    int idx = id.get_global_id(0) * x128::size;
     int N = B * T * C;
     if (idx >= N) { return; }
 
@@ -155,19 +155,19 @@ void wpe_backward_kernel(sycl::nd_item<2> id, floatX* dwpe,
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void encoder_forward(sycl::queue &q, floatX* out,
+void encoder_forward(sycl::queue *stream, floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C) {
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         encoder_forward_kernel3(id, out, inp, wte, wpe, B, T, C);
-    });
+    }).wait();
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
-void encoder_backward(sycl::queue &q, floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
+void encoder_backward(sycl::queue *stream, floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, sycl::int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed) {
@@ -178,9 +178,9 @@ void encoder_backward(sycl::queue &q, floatX* dwte, floatX* dwpe, floatX* scratc
     const int grid_size = CEIL_DIV(N, block_size);
     sycl::range<2> grid_dim(1, grid_size);
     sycl::range<2> block_dim(1, block_size);
-    q.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
         wpe_backward_kernel(id, dwpe, dout, inp, B, T, C, seed);
-    });
+    }).wait();
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
@@ -226,12 +226,12 @@ void encoder_backward(sycl::queue &q, floatX* dwte, floatX* dwpe, floatX* scratc
     // Step 3: Copy data from host to device (async until the last one to avoid synchronising CPU/GPU twice)
     sycl::int4* d_bucket_info = (sycl::int4*)scratch;
     int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(sycl::int4));
-    q.memcpy(d_bucket_info, bucket_info, num_buckets * sizeof(sycl::int4));
-    q.memcpy(d_workload_indices, workload_indices, total_items * sizeof(int));
+    stream->memcpy(d_bucket_info, bucket_info, num_buckets * sizeof(sycl::int4)).wait();
+    stream->memcpy(d_workload_indices, workload_indices, total_items * sizeof(int)).wait();
 
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
-    q.submit([&](sycl::handler& h) {
+    stream->submit([&](sycl::handler& h) {
         sycl::local_accessor<float> local_acc(sycl::range<1>(256 * x128::size), h);
         sycl::range<2> grid_dim(1, num_buckets);
         sycl::range<2> block_dim(1, 256);
