@@ -190,8 +190,8 @@ void fused_residual_forward_kernel3(sycl::nd_item<2> item, floatX* residual, flo
     }
     // cache the mean and rstd for the backward pass later
     if (thread_id == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
+        mean[idx] = (floatX)m;
+        rstd[idx] = (floatX)s;
     }
 }
 
