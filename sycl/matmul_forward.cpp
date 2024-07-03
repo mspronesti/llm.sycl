@@ -1,8 +1,12 @@
 #include <iostream>
 #include <sycl/sycl.hpp>
 #include <omp.h>
+#include <oneapi/mkl.hpp>
 
 #include "common.hpp"
+
+auto MKL_OP_T = oneapi::mkl::transpose::trans;
+auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -57,7 +61,7 @@ void matmul_forward_kernel1(sycl::nd_item<2> id, float* out,
 
 // is there no better way other than just adding bias with a whole separate kernel?
 // this is a highly memory-bound operation, should be fused into the matmul kernel
-// but i can't seem to find a cuBLAS function that does this
+// but I can't seem to find a cuBLAS function that does this
 void add_bias(sycl::nd_item<1> id, float* out, const float* bias, int B, int T, int OC) {
     int idx = id.get_global_id(0);
     int stride = id.get_global_range(0);
@@ -175,6 +179,56 @@ void matmul_forward1(sycl::queue& q, float* out,
     }).wait();
 }
 
+// kernel 2 calls cuBLAS (oneMKL actually), which should be very efficient
+void matmul_forward2(sycl::queue &q, float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC,
+                     const int sqrt_block_size) {
+    // for reference API is:
+    // cublasStatus_t cublasSgemm(cublasHandle_t handle,
+    //                        cublasOperation_t transa, cublasOperation_t transb,
+    //                        int m, int n, int k,
+    //                        const float           *alpha,
+    //                        const float           *A, int lda,
+    //                        const float           *B, int ldb,
+    //                        const float           *beta,
+    //                        float           *C, int ldc)
+    // for us, inp is (B*T, C), weight is (OC, C), out is (B*T, OC)
+    // cuBLAS does C = alpha * A * B + beta * C
+    // where A is mxk, B is kxn, C is mxn
+    // now, because we use row-major storage, cuBLAS (which is column-major) sees our matrices transposed.
+    // algorithmically / in e.g. PyTorch we want to do: out = inp @ weight.T
+    // but because cuBLAS is column-major, we actually want to get it to calculate out.T . Mathematically, this is:
+    // out.T = weight @ inp.T
+    // but again, our variables look transposed, so using the actual weight/inp we have here in this function, this becomes
+    // out.T = weight.T @ inp
+    // so we need to get cuBLAS to calculate weight.T @ inp (the variables here are the actual ones in this function)
+    // => need to call cuBLAS with A = weight, B = inp
+    // => need to call cuBLAS with transa = CUBLAS_OP_T, transb = CUBLAS_OP_N
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    oneapi::mkl::blas::column_major::gemm(q,
+                                          MKL_OP_T, MKL_OP_N,
+                                          OC, B*T, C,
+                                          &alpha,
+                                          weight, C,
+                                          inp, C,
+                                          &beta,
+                                          out, OC
+    );
+    // and now we still have to add the bias... (ew)
+    if (bias != nullptr) {
+        int block_size = sqrt_block_size * sqrt_block_size;
+        int grid_size = ceil_div(OC * B * T, block_size);
+
+        q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            add_bias(id, out, bias, B, T, OC);
+        }).wait();
+    }
+}
+
 // handwritten, relatively efficient non-tensorcore matmul kernel
 void matmul_forward4(sycl::queue &q, float* out,
                      const float* inp, const float* weight, const float* bias,
@@ -205,6 +259,9 @@ void matmul_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             matmul_forward1(q, out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
+            break;
+        case 2:
+            matmul_forward2(q, out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
             break;
         case 4:
             matmul_forward4(q, out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
