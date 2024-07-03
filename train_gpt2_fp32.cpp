@@ -40,6 +40,10 @@ float atomicAdd(float* addr, float val) {
     return ref.fetch_add(val);
 }
 
+// for MKL
+auto MKL_OP_T = oneapi::mkl::transpose::trans;
+auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
+
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
@@ -730,10 +734,8 @@ void attention_forward(sycl::queue &queue, float* out, float* qkvr, float* att,
     const float beta = 0.0f;
     float* preatt = inp;
 
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                trans, no_trans,
+                                                MKL_OP_T, MKL_OP_N,
                                                 T, T, HS,
                                                 &alpha,
                                                 k, HS, T * HS,
@@ -754,15 +756,14 @@ void attention_forward(sycl::queue &queue, float* out, float* qkvr, float* att,
     float* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                no_trans, no_trans,
+                                                MKL_OP_N, MKL_OP_N,
                                                 HS, T, T,
                                                 &alpha,
                                                 v, HS, T * HS,
                                                 att, T, T * T,
                                                 &beta,
                                                 vaccum, HS, T * HS,
-                                                B * NH,
-                                                oneapi::mkl::blas::compute_mode::float_to_bf16
+                                                B * NH
     );
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -802,10 +803,9 @@ void matmul_backward(sycl::queue &q, float* dinp, float* dweight, float* dbias,
     float one = 1.0f;
     float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
+
     oneapi::mkl::blas::column_major::gemm(q,
-                                          no_trans, no_trans,
+                                          MKL_OP_N, MKL_OP_N,
                                           C, B*T, OC,
                                           &one,
                                           weight, C,
@@ -815,7 +815,7 @@ void matmul_backward(sycl::queue &q, float* dinp, float* dweight, float* dbias,
     ).wait();
     // backward to weight, uses += in the backward pass (accumulate the gradient)
     oneapi::mkl::blas::column_major::gemm(q,
-                                          no_trans, trans,
+                                          MKL_OP_N, MKL_OP_T,
                                           C, OC, B*T,
                                           &one,
                                           inp, C,
@@ -876,12 +876,10 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
         unpermute_kernel_backward(id, scratch, dout, B, T, NH, HS);
     });
 
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     // backward into datt
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            trans, no_trans,
+            MKL_OP_T, MKL_OP_N,
             T, T, HS,
             &alpha,
             v, HS, T * HS,
@@ -894,7 +892,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
     // backward into dv
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, trans,
+            MKL_OP_N, MKL_OP_T,
             HS, T, T,
             &alpha,
             scratch, HS, T * HS,
@@ -917,7 +915,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
     // backward into q
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, no_trans,
+            MKL_OP_N, MKL_OP_N,
             HS, T, T,
             &alpha,
             k, HS, T * HS,
@@ -929,7 +927,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
     // backward into k
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, trans,
+            MKL_OP_N, MKL_OP_T,
             HS, T, T,
             &alpha,
             q, HS, T * HS,
