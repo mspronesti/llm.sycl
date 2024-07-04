@@ -475,22 +475,22 @@ inline float lerp(float start, float end, float weight) {
     return sycl::fma(weight, end, sycl::fma(-weight, start, start));
 }
 
-void adamw_kernel2(sycl::nd_item<1> id, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
-                   long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+void adamw_kernel2(sycl::nd_item<1> id, float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                   float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     int i = id.get_local_id(0);
     if (i >= num_parameters) return;  // guard
-    float grad = d_grads[i];
-    float m = d_m_memory[i];
-    float v = d_v_memory[i];
+    float grad = grads_memory[i];
+    float m = m_memory[i];
+    float v = v_memory[i];
     // update the first moment (momentum)
     m = lerp(grad, m, beta1);
-    d_m_memory[i] = m;
+    m_memory[i] = m;
     // update the second moment (RMSprop)
     v = lerp(grad * grad, v, beta2);
-    d_v_memory[i] = v;
-    m /= beta1_correction;
-    v /= beta2_correction;
-    d_params[i] -= learning_rate * (m / (sycl::sqrt(v) + eps) + weight_decay * d_params[i]);
+    v_memory[i] = v;
+    m /= beta1_correction;  // m_hat
+    v /= beta2_correction;  // v_hat
+    params_memory[i] -= learning_rate * (m / (sycl::sqrt(v) + eps) + weight_decay * params_memory[i]);
 }
 
 struct SoftmaxParams {
@@ -560,94 +560,6 @@ void fused_classifier_kernel3(sycl::nd_item<1> id, float* logits, float* losses,
     }
 }
 
-sycl::float4 ld_vec(const float* address) {
-    return *reinterpret_cast<const sycl::float4*>(address);
-}
-
-void st_vec(float* address, sycl::float4 val) {
-    *reinterpret_cast<sycl::float4*>(address) = val;
-}
-
-void matmul_forward_kernel4(sycl::nd_item<2> id, float* out, const float* inp, const float* weight, const float* bias,
-                            int C, int OC,
-                            sycl::multi_ptr<float[128][32][2], sycl::access::address_space::local_space> local_mem_ptr) {
-    int blockIdx_x = id.get_group(1);
-    int blockIdx_y = id.get_group(0);
-
-    int threadIdx_x = id.get_local_id(1);
-    int threadIdx_y = id.get_local_id(0);
-
-    int blockDim_y = id.get_local_range(0);
-
-    float *shared = (float*) local_mem_ptr.get_raw();
-    float (*lhs_s)[32] = (float (*)[32]) shared;
-    float (*rhs_s)[32] = (float (*)[32]) (shared + 128 * 32);
-
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // each thread handles 8x8 elements; each block 128 by 128 elements.
-    int oc = 8*(blockIdx_y * blockDim_y + threadIdx_y);
-
-    // adjust our pointers for the current block
-    inp += 128 * blockIdx_x * C;
-    weight += 128 * blockIdx_y * C;
-    out += 128 * blockIdx_x * OC + 128 * blockIdx_y;
-
-    float vals[8][8] = {};
-    if(bias != nullptr) {
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j += 4) {
-                sycl::float4 b = ld_vec(bias + oc + j);
-                vals[i][j+0] = b.x();
-                vals[i][j+1] = b.y();
-                vals[i][j+2] = b.z();
-                vals[i][j+3] = b.w();
-            }
-        }
-    }
-
-    int si_start = 4*(16 * threadIdx_y + threadIdx_x);
-    for (int so = 0; so < C; so += 32) {
-        id.barrier();
-        int xmod8 = threadIdx_x % 8;
-        int xby8 = threadIdx_x / 8;
-        int xo = 4 * xmod8;
-        for(int y = 2 * threadIdx_y + xby8; y < 128; y += 32) {
-            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
-            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
-        }
-        id.barrier();
-
-        for (int si = si_start; si < si_start + 32; si += 4) {
-            sycl::float4 rhs[8];
-            for (int u = 0; u < 8; ++u) {
-                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx_y][si % 32]);
-            }
-
-            for (int ii = 0; ii < 8; ++ii) {
-                sycl::float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx_x][si % 32]);
-                for (int ji = 0; ji < 8; ++ji) {
-                    vals[ii][ji] += lhs.x() * rhs[ji].x();
-                    vals[ii][ji] += lhs.y() * rhs[ji].y();
-                    vals[ii][ji] += lhs.z() * rhs[ji].z();
-                    vals[ii][ji] += lhs.w() * rhs[ji].w();
-                }
-            }
-        }
-    }
-
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; j += 4) {
-            sycl::float4 result;
-            result.x() = vals[i][j + 0];
-            result.y() = vals[i][j + 1];
-            result.z() = vals[i][j + 2];
-            result.w() = vals[i][j + 3];
-            st_vec(out + (8*threadIdx_x+i) * OC + 8*threadIdx_y + j, result);
-        }
-    }
-}
-
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -686,23 +598,63 @@ void layernorm_forward(sycl::queue &q, float* out, float* mean, float* rstd,
     });
 }
 
+void add_bias(sycl::nd_item<1> id, float* out, const float* bias, int B, int T, int OC) {
+    int idx = id.get_global_id(0);
+    int stride = id.get_global_range(0);
+    for (int i = idx; i < B * T * OC; i += stride) {
+        int col = i % OC;
+        out[i] += bias[col];
+    }
+}
+
+// NOTE: kernel 4 was very slow on Intel GPUs. Opted for kernel 2 instead.
 // handwritten, relatively efficient non-tensorcore matmul kernel
 void matmul_forward(sycl::queue &q, float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    int sqrt_block_size = 16;
+    // for reference API is:
+    // cublasStatus_t cublasSgemm(cublasHandle_t handle,
+    //                        cublasOperation_t transa, cublasOperation_t transb,
+    //                        int m, int n, int k,
+    //                        const float           *alpha,
+    //                        const float           *A, int lda,
+    //                        const float           *B, int ldb,
+    //                        const float           *beta,
+    //                        float           *C, int ldc)
+    // for us, inp is (B*T, C), weight is (OC, C), out is (B*T, OC)
+    // cuBLAS does C = alpha * A * B + beta * C
+    // where A is mxk, B is kxn, C is mxn
+    // now, because we use row-major storage, cuBLAS (which is column-major) sees our matrices transposed.
+    // algorithmically / in e.g. PyTorch we want to do: out = inp @ weight.T
+    // but because cuBLAS is column-major, we actually want to get it to calculate out.T . Mathematically, this is:
+    // out.T = weight @ inp.T
+    // but again, our variables look transposed, so using the actual weight/inp we have here in this function, this becomes
+    // out.T = weight.T @ inp
+    // so we need to get cuBLAS to calculate weight.T @ inp (the variables here are the actual ones in this function)
+    // => need to call cuBLAS with A = weight, B = inp
+    // => need to call cuBLAS with transa = CUBLAS_OP_T, transb = CUBLAS_OP_N
 
-    sycl::nd_range<2> grid = sycl::nd_range<2>(sycl::range<2>(CEIL_DIV(OC, 8*sqrt_block_size) * sqrt_block_size,
-                                                              CEIL_DIV(B*T, 8*sqrt_block_size) * sqrt_block_size),
-                                               sycl::range<2>(sqrt_block_size, sqrt_block_size));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const int sqrt_block_size = 16;
+    oneapi::mkl::blas::column_major::gemm(q,
+                                          MKL_OP_T, MKL_OP_N,
+                                          OC, B*T, C,
+                                          &alpha,
+                                          weight, C,
+                                          inp, C,
+                                          &beta,
+                                          out, OC
+    ).wait();
+    // and now we still have to add the bias... (ew)
+    if (bias != nullptr) {
+        int block_size = sqrt_block_size * sqrt_block_size;
+        int grid_size = CEIL_DIV(OC * B * T, block_size);
 
-    q.parallel_for(grid, [=](sycl::nd_item<2> id) {
-        auto local_mem_ptr = sycl::ext::oneapi::group_local_memory_for_overwrite<float[128][32][2]>(
-                id.get_group());
-        matmul_forward_kernel4(id, out, inp, weight, bias, C, OC, local_mem_ptr);
-    });
+        q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            add_bias(id, out, bias, B, T, OC);
+        });
+    }
 }
 
 void attention_forward(sycl::queue &queue, float* out, float* qkvr, float* att,
