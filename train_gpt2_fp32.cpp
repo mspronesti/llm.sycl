@@ -177,9 +177,9 @@ void permute_kernel_backward(sycl::nd_item<1> id,
         int d_ = rest % d;
 
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        dinp[inp_idx] += dq[idx];
-        dinp[inp_idx + NH * d] += dk[idx];
-        dinp[inp_idx + 2 * (NH * d)] += dv[idx];
+        dinp[inp_idx] = dq[idx];
+        dinp[inp_idx + NH * d] = dk[idx];
+        dinp[inp_idx + 2 * (NH * d)] = dv[idx];
     }
 }
 
@@ -210,7 +210,7 @@ void unpermute_kernel_backward(sycl::nd_item<1> id, float* dinp, const float *do
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        dinp[idx] += dout[other_idx];
+        dinp[idx] = dout[other_idx];
     }
 }
 
