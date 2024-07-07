@@ -7,6 +7,13 @@
 #include <cstdlib>
 #include <chrono>
 
+template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
+static inline T atomicAdd(T* val, const T delta)
+{
+    sycl::atomic_ref<T, sycl::memory_order::relaxed,
+    MemoryScope> ref(*val);
+    return ref.fetch_add(delta);
+}
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores

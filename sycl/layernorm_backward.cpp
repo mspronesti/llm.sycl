@@ -98,14 +98,6 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 
 // ----------------------------------------------------------------------------
 // GPU kernels
-template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
-static inline T atomicAdd(T* val, const T delta)
-{
-  sycl::atomic_ref<T, sycl::memory_order::relaxed,
-     MemoryScope> ref(*val);
-  return ref.fetch_add(delta);
-}
-
 
 // super naive kernel that just parallelizes over B,T and loops over C
 void layernorm_backward_kernel1(sycl::nd_item<1> id, float* dinp, float* dweight, float* dbias,
