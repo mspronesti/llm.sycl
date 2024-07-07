@@ -2,6 +2,8 @@
 #include <sycl/sycl.hpp>
 #include <omp.h>
 #include <oneapi/mkl.hpp>
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include "common.hpp"
 
@@ -229,6 +231,70 @@ void matmul_forward2(sycl::queue &q, float* out,
     }
 }
 
+// uses cublasLt to fuse the bias and gelu
+// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
+// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
+void matmul_forward3(sycl::queue& queue, float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+    bool has_bias = (bias != nullptr);
+    bool has_gelu = false;
+
+    // Setup engine and stream
+    auto engine = dnnl::sycl_interop::make_engine(queue.get_device(), queue.get_context());
+    auto stream = dnnl::sycl_interop::make_stream(engine, queue);
+
+    // Create memory descriptors
+    auto inp_md = dnnl::memory::desc({B*T, C}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+    auto weight_md = dnnl::memory::desc({C, OC}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ba);
+    auto out_md = dnnl::memory::desc({B*T, OC}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+    auto bias_md = dnnl::memory::desc({1, OC}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+
+    // Create memory objects
+    auto inp_mem = dnnl::sycl_interop::make_memory(inp_md, engine, dnnl::sycl_interop::memory_kind::usm, const_cast<float *>(inp));
+    auto weight_mem = dnnl::sycl_interop::make_memory(weight_md, engine, dnnl::sycl_interop::memory_kind::usm, const_cast<float *>(weight));
+    auto out_mem = dnnl::sycl_interop::make_memory(out_md, engine, dnnl::sycl_interop::memory_kind::usm, out);
+    auto bias_mem = dnnl::sycl_interop::make_memory(bias_md, engine, dnnl::sycl_interop::memory_kind::usm, const_cast<float *>(bias));
+
+    // Create primitive attributes
+    dnnl::primitive_attr matmul_attr;
+    if (has_gelu) {
+        dnnl::post_ops po;
+        po.append_eltwise(dnnl::algorithm::eltwise_gelu_tanh, 1.0f, 0.0f);
+        matmul_attr.set_post_ops(po);
+    }
+
+    // Create primitive descriptor
+    dnnl::matmul::primitive_desc matmul_pd;
+    if (has_bias) {
+        matmul_pd = dnnl::matmul::primitive_desc(engine, inp_md, weight_md, bias_md, out_md, matmul_attr);
+    }
+    else {
+        matmul_pd = dnnl::matmul::primitive_desc(engine, inp_md, weight_md, out_md, matmul_attr);
+    }
+
+    // Create primitive
+    auto matmul_prim = dnnl::matmul(matmul_pd);
+
+    // Set arguments and execute
+    if (has_bias) {
+        matmul_prim.execute(stream, {
+                {DNNL_ARG_SRC, inp_mem},
+                {DNNL_ARG_WEIGHTS, weight_mem},
+                {DNNL_ARG_BIAS, bias_mem},
+                {DNNL_ARG_DST, out_mem}
+        });
+    }
+    else {
+        matmul_prim.execute(stream, {
+                {DNNL_ARG_SRC, inp_mem},
+                {DNNL_ARG_WEIGHTS, weight_mem},
+                {DNNL_ARG_DST, out_mem}
+        });
+    }
+    stream.wait();
+}
+
 // handwritten, relatively efficient non-tensorcore matmul kernel
 void matmul_forward4(sycl::queue &q, float* out,
                      const float* inp, const float* weight, const float* bias,
@@ -262,6 +328,9 @@ void matmul_forward(int kernel_num,
             break;
         case 2:
             matmul_forward2(q, out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
+            break;
+        case 3:
+            matmul_forward3(q, out, inp, weight, bias, B, T, C, OC);
             break;
         case 4:
             matmul_forward4(q, out, inp, weight, bias, B, T, C, OC, sqrt_block_size);

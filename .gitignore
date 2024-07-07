@@ -2,4 +2,7 @@
 cmake-build-debug/
 build/
 
+.venv/
+# data folder
 data/
+*.bin

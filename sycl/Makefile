@@ -27,6 +27,8 @@ ifeq ($(HIP),yes)
     CFLAGS += -fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=$(HIP_ARCH)
 endif
 
+matmul_forward: matmul_forward.cpp
+	$(CC) $(CFLAGS) $< -ldnnl -o $@
 # Build rule for individual files
 %: %.cpp
 	$(CC) $(CFLAGS) $< -o $@
