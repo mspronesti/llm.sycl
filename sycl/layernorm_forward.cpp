@@ -254,6 +254,134 @@ void layernorm_forward_kernel4(sycl::nd_item<1> id, float* __restrict__ out, flo
     }
 }
 
+// like 4, but in kernel 5 we have each block doing one row, not just a single warp
+void layernorm_forward_kernel5(sycl::nd_item<1> id, float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                               const float*  __restrict__ inp, const float*  __restrict__ weight,
+                               const float* __restrict__ bias, int N, int C) {
+    int thread_idx_x = id.get_local_id(0);
+
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+
+    int idx = id.get_group(0); // simply one block per row
+    // the row of input that this group of threads is responsible for
+    const float* x = inp + idx * C;
+    // thread coarsening through the row, reduce the sum in series
+    float thread_sum = 0.0; // stores sum(x)
+    float thread_sum2 = 0.0; // stores sum(x**2)
+    for (int i = thread_idx_x; i < C; i += id.get_local_range(0)) {
+        float xi = x[i];
+        thread_sum += xi;
+        thread_sum2 += xi * xi;
+    }
+    // block-level reduction
+    float block_sum = sycl::reduce_over_group(block, thread_sum, sycl::plus<float>{}); // sum(x)
+    float block_sum2 = sycl::reduce_over_group(block, thread_sum2, sycl::plus<float>{}); // sum(x**2)
+    // mean, var, rstd
+    block_sum /= C; // mean(x)
+    block_sum2 /= C; // mean(x**2)
+    float m = block_sum;
+    float var = block_sum2 - m * m;
+    float s = sycl::rsqrt(var + 1e-5f);
+    // store the mean, no need to cache it
+    if(thread_idx_x == 0 && mean != nullptr) {
+        mean[idx] = m;
+    }
+    // store the rstd, no need to cache it
+    if(thread_idx_x == 0 && rstd != nullptr) {
+        rstd[idx] = s;
+    }
+    // final normalization and scaling by weight/bias
+    float* o = out + idx * C;
+    for (int i = thread_idx_x; i < C; i += id.get_local_range(0)) {
+        float n = s * (x[i] - m);
+        o[i] = n * weight[i] + bias[i];
+    }
+}
+
+// Inspired by `fused_residual_forward_kernel5` in fused_residual_forward.cpp
+void layernorm_forward_kernel6(sycl::nd_item<2> item, float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                          const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                          const float* __restrict__ bias, int N, int C,
+                                          sycl::local_accessor<char> local_acc) {
+    constexpr const int WarpSize = 32;
+    assert(item.get_local_range(1) == WarpSize);
+
+    auto sg = item.get_sub_group();
+    int threadIdx_x = item.get_local_id(1);
+    int threadIdx_y = item.get_local_id(0);
+
+    // load weights and biases into shared memory
+    // do this before we allow any threads to exit!
+    auto params = (char *)local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+
+    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
+    // let's keep everything as x128
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    x128* s_in = reinterpret_cast<x128*>(params) + ((2 + threadIdx_y) * C / x128::size);
+
+    int sidx = (threadIdx_x + WarpSize * threadIdx_y) * x128::size;
+    for(int i = sidx; i < C; i += item.get_local_range(0) * WarpSize * x128::size) {
+        s_weight[i/x128::size] = load128(weight + i);
+        s_bias[i/x128::size] = load128(bias + i);
+    }
+    sycl::group_barrier(item.get_group());
+
+    int idx = item.get_group(0) * item.get_local_range(0) + threadIdx_y;
+    if(idx >= N) { return; } // guard
+
+    // adjust pointers to current token
+    inp += idx * C;
+    out += idx * C;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in_data = load128cs(inp + c);
+        for(int k = 0; k < x128::size; ++k) {
+            sum += (float)in_data[k];
+        }
+        s_in[c / x128::size] = in_data;
+    }
+
+    sum =  sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+    float m = sum / C;
+    float v = 0.f;
+
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in_data = s_in[c / x128::size];
+        for(int k = 0; k < x128::size; ++k) {
+            v += ((float)in_data[k] - m) * ((float)in_data[k] - m);
+        }
+    }
+
+    v = sycl::reduce_over_group(sg, v, sycl::plus<float>()) / C;
+    float s = sycl::rsqrt(v + eps);
+
+    for(int c = threadIdx_x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in_data = s_in[c / x128::size];
+        const x128 w = s_weight[c / x128::size];
+        const x128 b = s_bias[c / x128::size];
+        x128 out_data;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)in_data[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out_data[k] = o;
+        }
+
+        store128cs(out + c, out_data);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(threadIdx_x == 0 && mean != nullptr) {
+        mean[idx] = m;
+    }
+    // store the rstd, no need to cache it
+    if(threadIdx_x == 0 && rstd != nullptr) {
+        rstd[idx] = s;
+    }
+}
+
 
 
 // ----------------------------------------------------------------------------
@@ -315,6 +443,51 @@ void layernorm_forward4(sycl::queue &q, float* out, float* mean, float* rstd,
     }).wait();
 }
 
+void layernorm_forward5(sycl::queue &q, float* out, float* mean, float* rstd,
+                        const float* inp, const float* weight, const float* bias,
+                        int B, int T, int C,
+                        const int block_size) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    const int grid_size = N;
+    q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        layernorm_forward_kernel5(id, out, mean, rstd, inp, weight, bias, N, C);
+    }).wait();
+}
+
+void layernorm_forward6(sycl::queue &q, float* out, float* mean, float* rstd,
+                        const float* inp, const float* weight, const float* bias,
+                        int B, int T, int C,
+                        const int block_size) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    int block_y = block_size / 32;
+    const int grid_size = ceil_div(N, block_y);
+    size_t smem = (2 + block_y) * C * sizeof(float);
+
+    auto local_mem = q.get_device().get_info<sycl::info::device::local_mem_size>();
+    if (local_mem > smem) {
+        sycl::nd_range<2> grid = sycl::nd_range<2>(
+                sycl::range<2>(grid_size * block_y, 32),
+                sycl::range<2>(block_y, 32)
+        );
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<char> local_acc(smem, h);
+            h.parallel_for(grid, [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(32)]] {
+                layernorm_forward_kernel6(item, out, mean, rstd, inp, weight, bias, N, C, local_acc);
+            });
+        });
+    } else {
+        const int grid_size = N;
+        std::cout << "Not enough unified shared memory, falling back to kernel 5\n";
+        q.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+            layernorm_forward_kernel5(item, out, mean, rstd, inp, weight, bias, N, C);
+        });
+    }
+    q.wait();
+}
+
 
 
 // kernel version dispatch
@@ -336,6 +509,12 @@ void layernorm_forward(int kernel_num,
             break;
         case 4:
             layernorm_forward4(q, out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 5:
+            layernorm_forward5(q, out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 6:
+            layernorm_forward6(q, out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             std::cout << "Invalid kernel number\n";
