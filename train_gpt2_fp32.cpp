@@ -60,7 +60,7 @@ inline sycl::float4 add_float4(const sycl::float4& a, const sycl::float4& b) {
 // very helpful in memory-bound kernels like encoder_forward
 void encoder_forward_kernel3(sycl::nd_item<1> id, sycl::float4* out, const int* inp, const sycl::float4* wte, const sycl::float4* wpe, int B, int T, int C) {
     int C4 = C / 4;
-    int idx = id.get_local_id(0);
+    int idx = id.get_global_id(0);
     int N = B * T * C4;
     if (idx < N) {
     int bt = idx / C4;
@@ -76,7 +76,7 @@ void encoder_forward_kernel3(sycl::nd_item<1> id, sycl::float4* out, const int* 
 void encoder_backward_kernel(sycl::nd_item<1> id, float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
                                         int B, int T, int C) {
-    int idx = id.get_local_id(0);
+    int idx = id.get_global_id(0);
     int N = B * T * C;
 
     if (idx < N) {
@@ -194,7 +194,6 @@ void unpermute_kernel(sycl::nd_item<1> id, const float* inp, float *out, int B, 
         rest = rest % (N * d);
         int n = rest / d;
         int d_ = rest % d;
-
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
         out[other_idx] = inp[idx];
     }
@@ -229,7 +228,11 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     // uses the online softmax algorithm
     assert(T % 4  == 0);
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    // micro-optimization: we iterate backwards so that
+    // after the softmax backward operation completes, the cache retains the
+    // part of the matrix close to the upper left corner, which benefits the
+    // matmul operation that immediately follows.
+    int idx = (id.get_group_range(0) - id.get_group(0) - 1) * warp.get_group_linear_range() + warp.get_group_linear_id(); // backward order
     if(idx >= N * T) {
         return;
     }
@@ -327,7 +330,7 @@ void matmul_backward_bias_kernel4(sycl::nd_item<1> id, float* dbias, const float
     const int vstep = warp.get_group_linear_range(); // number of warps in a block, e.g. 4
 
     // pointer to the start of the column for one lane of threads
-    // so e.g. 4 threads (of the same lane_id) will reduce this one column
+    // so e.g. 4 threads (of the same lane_id) will reduce tlhis one column
     const float* dout_col = dout + tl + lane_id;
 
     // column reductions by looping through the rows
@@ -337,7 +340,7 @@ void matmul_backward_bias_kernel4(sycl::nd_item<1> id, float* dbias, const float
     // leading to a coalesced memory access pattern
     float dout_sum = 0.0f;
     for (int row = warp_id; row < B * T; row += vstep) {
-        dout_sum += (float)dout_col[row * OC];
+        dout_sum += dout_col[row * OC];
     }
     shared[lane_id + warp_id * warpSize] = dout_sum;
     sycl::group_barrier(id.get_group());
@@ -371,8 +374,8 @@ void layernorm_backward_kernel2(sycl::nd_item<1> id, float* dinp, float* dweight
     const float* dout_bt = dout + b * T * C + t * C;
     const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
-    const float mean_bt = (float)mean[b * T + t];
-    const float rstd_bt = (float)rstd[b * T + t];
+    const float mean_bt = mean[b * T + t];
+    const float rstd_bt = rstd[b * T + t];
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
@@ -390,8 +393,8 @@ void layernorm_backward_kernel2(sycl::nd_item<1> id, float* dinp, float* dweight
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
     for (int i = warp.get_local_linear_id(); i < C; i  += warp_size) {
-        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
@@ -402,19 +405,19 @@ void layernorm_backward_kernel2(sycl::nd_item<1> id, float* dinp, float* dweight
 
     // now iterate again and accumulate all the gradients
     for (int i = warp.get_local_linear_id(); i < C; i += warp_size) {
-        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
         // gradient contribution to bias
-        atomicAdd(&dbias_shared[i], (float)dout_bt[i]);
+        atomicAdd(&dbias_shared[i], dout_bt[i]);
         // gradient contribution to weight
-        atomicAdd(&dweight_shared[i], norm_bti * (float)dout_bt[i]);
+        atomicAdd(&dweight_shared[i], norm_bti * dout_bt[i]);
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
         dval -= dnorm_mean; // term 2
         dval -= norm_bti * dnorm_norm_mean; // term 3
         dval *= rstd_bt; // final scale
-        dinp_bt[i] = (float)((float)dinp_bt[i] + dval);
+        dinp_bt[i] += dval;
     }
     sycl::group_barrier(id.get_group());
 
@@ -458,7 +461,9 @@ void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id,
             local_sum += att_bth[t2] * datt_bth[t2];
         }
 
-        local_sum = sycl::reduce_over_group(block, local_sum, sycl::plus<float>{});
+        block_acc[warp.get_group_linear_id()] = sycl::reduce_over_group(warp, local_sum, sycl::plus<float>{});
+        sycl::group_barrier(block);
+        local_sum = sycl::reduce_over_group(warp, block_acc[warp.get_local_linear_id()], sycl::plus<float>{});
 
         for (int t3 = block.get_local_linear_id(); t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
@@ -477,7 +482,7 @@ inline float lerp(float start, float end, float weight) {
 
 void adamw_kernel2(sycl::nd_item<1> id, float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                    float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    int i = id.get_local_id(0);
+    int i = id.get_global_id(0);
     if (i >= num_parameters) return;  // guard
     float grad = grads_memory[i];
     float m = m_memory[i];
@@ -508,7 +513,7 @@ SoftmaxParams prepare_softmax_blockwide_nofloat4(sycl::nd_item<1> id, int idx, c
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = V + id.get_local_linear_id() - id.get_local_range(0); i >= 0; i -= id.get_local_range(0)) {
+    for (int i = V + id.get_local_id(0) - id.get_local_range(0); i >= 0; i -= id.get_local_range(0)) {
         float v = x[i];
         float old_maxval = thread_maxval;
         thread_maxval = sycl::fmax(thread_maxval, v);
@@ -811,7 +816,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
                         int B, int T, int C, int NH) {
     const int block_size = 256;
     int HS = C / NH; // head size
-    const float alpha = 1.0f, zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    const float one = 1.0f, zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
     const float *q, *k, *v;
     q = qkvr + 0 * B * T * C;
@@ -833,7 +838,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
             queue,
             MKL_OP_T, MKL_OP_N,
             T, T, HS,
-            &alpha,
+            &one,
             v, HS, T * HS,
             scratch, HS, T * HS,
             &zero,
@@ -846,7 +851,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
             queue,
             MKL_OP_N, MKL_OP_T,
             HS, T, T,
-            &alpha,
+            &one,
             scratch, HS, T * HS,
             att, T, T * T,
             &zero,
@@ -869,7 +874,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
             queue,
             MKL_OP_N, MKL_OP_N,
             HS, T, T,
-            &alpha,
+            &one,
             k, HS, T * HS,
             dpreatt, T, T * T,
             &zero,
@@ -881,7 +886,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
             queue,
             MKL_OP_N, MKL_OP_T,
             HS, T, T,
-            &alpha,
+            &one,
             q, HS, T * HS,
             dpreatt, T, T * T,
             &zero,
