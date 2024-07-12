@@ -25,7 +25,7 @@ make attention_forward
 
 Then run it with
 ```shell
-.attention_forward
+./attention_forward
 ```
 
 Use the `-DCUDA` and `-DCUDA_ARCH` flags to enable NVIDIA support. Similarly, `-DHIP` and `-DHIP_ARCH` for AMD support.
