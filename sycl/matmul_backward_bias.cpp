@@ -8,6 +8,8 @@
 #define ENABLE_BF16
 #include "common.hpp"
 
+namespace oneapi_ext = sycl::ext::oneapi::experimental;
+
 // ----------------------------------------------------------------------------
 // utility functions
 bool isPowerOfTwo(int n) {
@@ -252,7 +254,175 @@ void matmul_backward_bias_kernel7(sycl::nd_item<2> id, float* dbias, const float
     }
 }
 
+// We want to decrease the amount of channels handled by each block, so that we need fewer across-block reductions.
+// We do this by realizing the following: For scalar memory access, we need to read one element per thread in a warp
+// to read an entire cacheline, but for vectorized memory access, with 128 bit of data per thread, we only need eight
+// threads to fetch a cacheline, which means that we can already operate on a "depth" of four within a single warp.
+// => blockDim.x == 4, blockDim.y == 32/4 = 8
+//
+template<typename OutFloat, bool Atomic>
+void matmul_backward_bias_kernel8(sycl::nd_item<3> id, OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+                                  std::bool_constant<Atomic>, sycl::local_accessor<float> local_acc) {
+    sycl::sub_group warp = id.get_sub_group();
+    constexpr const int bdx = 4;
+    constexpr const int bdy = 32 / bdx;
 
+
+    int warp_d = (int)id.get_local_id(2);
+    int warp_c = (int)id.get_local_id(1);
+    int block_d = (int)id.get_local_id(0);
+
+    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
+
+    int local_oc = warp_c * x128::size;
+    int global_oc = id.get_group(2) * OC_per_warp + local_oc;
+
+    int local_bt = warp_d + bdx * block_d;
+    int bt_per_block = bdx * id.get_local_range(0);
+
+    float accumulators[x128::size];
+    for (int k = 0; k < x128::size; k++) {
+        accumulators[k] = 0.0f;
+    }
+
+    if(global_oc < OC) {
+        // sum up over all bt within registers
+        for (int idx = id.get_group(1) * bt_per_block + local_bt; idx < B * T; idx += id.get_group_range(1) * bt_per_block) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+        }
+    }
+
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+    float (*sub_results)[32][bdy] = (float (*)[32][bdy])shared;
+    // reference: https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_non_uniform_groups.asciidoc#creation-1
+    auto group_partition_4 = oneapi_ext::get_fixed_size_group<4>(warp);
+
+    // reduce within-warp results
+    for (int k = 0; k < x128::size; k++) {
+        float v = accumulators[k];
+        v = sycl::reduce_over_group(group_partition_4, v, sycl::plus<float>());
+        if(warp_d == 0) {
+            sub_results[k][block_d][warp_c] = v;
+        }
+    }
+    sycl::group_barrier(id.get_group());
+
+    // block-wide reductions
+    for (int k = block_d; k < x128::size; k += id.get_local_range(0)) {
+        float a = 0.f;
+        for (int r = warp_d; r < id.get_local_range(0); r += bdx) {
+            float v = sub_results[k][r][warp_c];
+            v = sycl::reduce_over_group(group_partition_4, v, sycl::plus<float>());
+            a += v;
+        }
+        if(warp_d == 0 && global_oc < OC) {
+            // coalesced, but not cacheline-sized
+            if constexpr (!Atomic) {
+                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+            } else {
+                atomicAdd(dbias + global_oc + k, a);
+            }
+        }
+    }
+}
+
+// Like kernel 8, but instead of accumulating to the auxiliary buffer, it writes
+// multiple values that need to be summed up in a separate kernel call.
+// If UseAuxBuffer is false, gridDim.y has to be one, and results are added directly
+// to dbias.
+template<typename OutFloat, bool UseAuxBuffer>
+void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+                                  std::bool_constant<UseAuxBuffer>, sycl::local_accessor<float> local_acc) {
+
+    sycl::sub_group warp = id.get_sub_group();
+    constexpr const int bdx = 4;
+    constexpr const int bdy = 32 / bdx;
+
+
+    int warp_d = (int)id.get_local_id(2);
+    int warp_c = (int)id.get_local_id(1);
+    int block_d = (int)id.get_local_id(0);
+
+    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
+
+    int local_oc = warp_c * x128::size;
+    int global_oc = id.get_group(2) * OC_per_warp + local_oc;
+
+    int local_bt = warp_d + bdx * block_d;
+    int bt_per_block = bdx * id.get_local_range(0);
+
+    float accumulators[x128::size];
+    for (int k = 0; k < x128::size; k++) {
+        accumulators[k] = 0.0f;
+    }
+
+    if(global_oc < OC) {
+        // sum up over all bt within registers
+        for (int idx = id.get_group(1) * bt_per_block + local_bt; idx < B * T; idx += id.get_group_range(1) * bt_per_block) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+        }
+    }
+
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+    float (*sub_results)[32][bdy] = (float (*)[32][bdy])shared;
+    // reference: https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_non_uniform_groups.asciidoc#creation-1
+    auto group_partition_4 = oneapi_ext::get_fixed_size_group<4>(warp);
+
+    // reduce within-warp results
+    for (int k = 0; k < x128::size; k++) {
+        float v = accumulators[k];
+        v = sycl::reduce_over_group(group_partition_4, v, sycl::plus<float>());
+        if(warp_d == 0) {
+            sub_results[k][block_d][warp_c] = v;
+        }
+    }
+    sycl::group_barrier(id.get_group());
+
+    // block-wide reductions
+    for (int k = block_d; k < x128::size; k += id.get_local_range(0)) {
+        float a = 0.f;
+        for (int r = warp_d; r < id.get_local_range(0); r += bdx) {
+            float v = sub_results[k][r][warp_c];
+            v = sycl::reduce_over_group(group_partition_4, v, sycl::plus<float>());
+            a += v;
+        }
+        if(warp_d == 0 && global_oc < OC) {
+            // coalesced, but not cacheline-sized
+            if constexpr (!UseAuxBuffer) {
+                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+            } else {
+                dbias[global_oc + k + id.get_group(1) * OC] = a;
+            }
+        }
+    }
+}
+
+void reduce_add_sum_kernel(sycl::nd_item<1> id, floatX* dst, const float* src, size_t n, size_t m) {
+    const size_t idx = id.get_global_id(0) * f128::size;
+    assert(n % x128::size == 0);
+    if (idx < n) {
+        f128 acc;
+        for(int k = 0; k < f128::size; ++k) {
+            acc[k] = 0.f;
+        }
+
+        for(int l = 0; l < m; ++l) {
+            f128 s = load128(src + idx + n * l);
+            for(int k = 0; k < f128::size; ++k) {
+                acc[k] += s[k];
+            }
+        }
+        for(int k = 0; k < f128::size; ++k) {
+            dst[idx + k] = (floatX) ((float)dst[idx + k] + acc[k]);
+        }
+    }
+}
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -367,6 +537,83 @@ void matmul_backward_bias7(sycl::queue &q, floatX* dbias, const floatX* dout,
     }).wait();
 }
 
+void matmul_backward_bias8(sycl::queue &q, floatX* dbias, const floatX* dout,
+                           int B, int T, int OC, int block_size) {
+    sycl::range<3> block_dim((unsigned)block_size/32, 8, 4);
+    const int OC_per_warp = block_dim[1] * x128::size; // 64 at BF16
+    const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    int max_wgs = q.get_device().get_info<sycl::info::device::max_work_group_size>();
+
+    const int grid_size_y = std::max(1, max_CUs * max_wgs / (block_size * grid_size_x)); // full GPU!
+
+    sycl::range<3> grid_dim(1, grid_size_y, grid_size_x);
+
+    // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
+    // and write results directly to the output.
+    if(grid_size_y == 1) {
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float> local_acc(x128::size*32*8, h);
+            h.parallel_for(sycl::nd_range<3>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<3> id) [[sycl::reqd_sub_group_size(32)]] {
+                matmul_backward_bias_kernel8(id, dbias, dout, B, T, OC, std::bool_constant<false>{}, local_acc);
+            });
+        }).wait();
+    } else {
+        // this is needed because dbias_buffer is a non const global variable
+        // and can't be passed to the kernel directly in SYCL
+        float* dbias_buffer_loc = dbias_buffer;
+
+        q.memset(dbias_buffer_loc, 0, OC * sizeof(float));
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float> local_acc(x128::size*32*8, h);
+            h.parallel_for(sycl::nd_range<3>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<3> id) [[sycl::reqd_sub_group_size(32)]] {
+                matmul_backward_bias_kernel8(id, dbias_buffer_loc, dout, B, T, OC, std::bool_constant<true>{}, local_acc);
+            });
+        });
+        q.parallel_for(sycl::nd_range<1>(ceil_div(OC, 256)*256, 256), [=](sycl::nd_item<1> id) {
+            cast_and_add_kernel(id, dbias, dbias_buffer_loc, OC);
+        });
+        q.wait();
+    }
+}
+
+void matmul_backward_bias9(sycl::queue &q, floatX* dbias, const floatX* dout,
+                           int B, int T, int OC, int block_size) {
+    sycl::range<3> block_dim((unsigned)block_size/32, 8, 4);
+    const int OC_per_warp = block_dim[1] * x128::size; // 64 at BF16
+    const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    int max_wgs = q.get_device().get_info<sycl::info::device::max_work_group_size>();
+
+    const int grid_size_y = std::max(1, max_CUs * max_wgs / (block_size * grid_size_x)); // full GPU!
+
+    sycl::range<3> grid_dim(1, grid_size_y, grid_size_x);
+
+    // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
+    // and write results directly to the output.
+    if(grid_size_y == 1) {
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float> local_acc(x128::size*32*8, h);
+            h.parallel_for(sycl::nd_range<3>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<3> id) [[sycl::reqd_sub_group_size(32)]] {
+                matmul_backward_bias_kernel9(id, dbias, dout, B, T, OC, std::bool_constant<false>{}, local_acc);
+            });
+        }).wait();
+    } else {
+        // kernel 9 overwrites temp buffer, so no need to memset
+        float *dbias_buffer_loc = dbias_buffer;
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float> local_acc(x128::size*32*8, h);
+            h.parallel_for(sycl::nd_range<3>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<3> id) [[sycl::reqd_sub_group_size(32)]] {
+                matmul_backward_bias_kernel9(id, dbias_buffer_loc, dout, B, T, OC, std::bool_constant<true>{}, local_acc);
+            });
+        });
+        q.parallel_for(sycl::nd_range<1>(ceil_div(OC, 256*f128::size)*256, 256), [=](sycl::nd_item<1> id) {
+            reduce_add_sum_kernel(id, dbias, dbias_buffer_loc, OC, grid_size_y);
+        });
+        q.wait();
+    }
+}
+
 void matmul_backward_bias(int kernel_num,
                           sycl::queue &q,
                           floatX* dbias, floatX* dout,
@@ -391,6 +638,12 @@ void matmul_backward_bias(int kernel_num,
 #endif
         case 7:
             matmul_backward_bias7(q, dbias, dout, B, T, OC, block_size);
+            break;
+        case 8:
+            matmul_backward_bias8(q, dbias, dout, B, T, OC, block_size);
+            break;
+        case 9:
+            matmul_backward_bias9(q, dbias, dout, B, T, OC, block_size);
             break;
         default:
             std::cout << "Invalid kernel number\n";
