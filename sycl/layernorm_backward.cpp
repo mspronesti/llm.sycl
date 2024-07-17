@@ -5,8 +5,9 @@
 #include <cassert>
 #include <chrono>
 
-//#define ENABLE_BF16
+#define ENABLE_BF16
 #include "common.hpp"
+
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -226,6 +227,295 @@ void copy_to_dweight_dbias(sycl::nd_item<1> id, int C, Tparams* dbias, Tparams* 
     }
 }
 
+// FP32 scratchpad per threadgroup, zero atomics except atomicAdd on uint for the flag (based on kernel3)
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward_kernel5(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                                const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                                int B, int T, int C, sycl::local_accessor<float> local_acc) {
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C
+
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int warp_size = warp.get_max_local_range()[0];
+    int base_idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+#pragma unroll 4
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)){
+        dbias_shared[i] = 0.0f;
+        dweight_shared[i] = 0.0f;
+    }
+    uint *tmp_flag = (uint*)(shared + C*2);
+    sycl::group_barrier(block);
+
+    int warps_in_grid = id.get_group_range(0) *  warp.get_group_linear_range();
+    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const Tdout* dout_bt = dout + b * T * C + t * C;
+        const Trest* inp_bt = inp + b * T * C + t * C;
+        Tdinp* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warp.get_local_linear_id(); i < C; i  += warp.get_max_local_range()[0]) {
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+            dnorm_mean += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
+        dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
+        dnorm_mean = dnorm_mean / C;
+        dnorm_norm_mean = dnorm_norm_mean / C;
+
+        // now iterate again and accumulate all the gradients
+        for (int i = warp.get_local_linear_id(); i < C; i += warp.get_max_local_range()[0]) {
+            float dout_i = (float)dout_bt[i];
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * dout_i;
+            // gradient contribution to bias
+            atomicAdd(&dbias_shared[i], dout_i);
+            // gradient contribution to weight
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
+            // gradient contribution to input
+            float dval = 0.0f;
+            dval += dnorm_i; // term 1
+            dval -= dnorm_mean; // term 2
+            dval -= norm_bti * dnorm_norm_mean; // term 3
+            dval *= rstd_bt; // final scale
+            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+        }
+    }
+    sycl::group_barrier(block);
+
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C * id.get_group_range(0);
+    uint* scratchFlag = (uint*)(scratch + (2 * C * id.get_group_range(0)));
+
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+        scratch_dbias[i + C*id.get_group(0)] = dbias_shared[i];
+        scratch_dweight[i + C*id.get_group(0)] = dweight_shared[i];
+    }
+    sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::device);
+    sycl::group_barrier(block);
+    if (id.get_local_id(0) == 0) {
+        *tmp_flag = atomicAdd(scratchFlag, (uint)1);
+    }
+    sycl::group_barrier(block);
+    if (*tmp_flag == id.get_group_range(0)-1) {
+        // last block to finish, accumulate the scratchpad
+        for (int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+            float dbias_sum = 0.0f;
+            float dweight_sum = 0.0f;
+#pragma unroll 8
+            for (int j = 0; j < id.get_group_range(0); j++) {
+                dbias_sum += scratch_dbias[i + j*C];
+                dweight_sum += scratch_dweight[i + j*C];
+            }
+            dbias[i] = (Tparams)((float)dbias[i] + dbias_sum);
+            dweight[i] = (Tparams)((float)dweight[i] + dweight_sum);
+        }
+    }
+}
+
+
+// single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward_kernel6(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                                const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                                int B, int T, int C, sycl::local_accessor<float> local_acc) {
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C + 1
+
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int base_idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+#pragma unroll 4
+    for (int i = id.get_local_id(0); i < C; i += id.get_local_range(0)) {
+        dbias_shared[i] = 0.0f;
+        dweight_shared[i] = 0.0f;
+    }
+    uint *tmp_flag = (uint*)(shared + C*2);
+    sycl::group_barrier(block);
+
+    int warps_in_grid = id.get_group_range(0) * warp.get_group_linear_range();
+    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const Tdout* dout_bt = dout + b * T * C + t * C;
+        const Trest* inp_bt = inp + b * T * C + t * C;
+        Tdinp* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warp.get_local_linear_id(); i < C; i  += warp.get_max_local_range()[0]) {
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+            dnorm_mean += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
+        dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
+        dnorm_mean = dnorm_mean / C;
+        dnorm_norm_mean = dnorm_norm_mean / C;
+
+        // now iterate again and accumulate all the gradients
+        for (int i = warp.get_local_linear_id(); i < C; i += warp.get_max_local_range()[0]) {
+            float dout_i = (float)dout_bt[i];
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * dout_i;
+            // gradient contribution to bias
+            atomicAdd(&dbias_shared[i], dout_i);
+            // gradient contribution to weight
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
+            // gradient contribution to input
+            float dval = 0.0f;
+            dval += dnorm_i; // term 1
+            dval -= dnorm_mean; // term 2
+            dval -= norm_bti * dnorm_norm_mean; // term 3
+            dval *= rstd_bt; // final scale
+            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+        }
+    }
+
+    // Accumulate into a FP32 scratchpad
+    // BF16 atomics are potentially much slower... and this is more precise!
+    sycl::group_barrier(block);
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C;
+    uint* scratchFlag = (uint*)(scratch + (2 * C));
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
+        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
+    }
+    sycl::group_barrier(block);
+    if (block.leader()) {
+        *tmp_flag = atomicAdd(scratchFlag, (uint)1);
+    }
+    sycl::group_barrier(block);
+    if (*tmp_flag == id.get_group_range(0)-1) {
+        for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+            // todo - potentially do stochastic rounding here as well
+            dbias[i] = (Tparams)scratch_dbias[i];
+            dweight[i] = (Tparams)scratch_dweight[i];
+        }
+    }
+}
+
+// Same as kernel 6 but without cooperative groups or templates
+void layernorm_backward_kernel7(sycl::nd_item<1> id, floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                                const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
+                                int B, int T, int C, sycl::local_accessor<float> local_acc) {
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C + 1
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int warpSize = warp.get_max_local_range()[0];
+    int warpId = id.get_local_id(0) / warpSize; // warp index within a block
+    int warpsInBlock = id.get_local_range(0) / warpSize;
+    int base_idx =id.get_group(0) * warpsInBlock + warpId;
+    int warpThreadIdx = id.get_local_id(0) % warpSize; // Thread index within the warp
+    int warps_in_grid = id.get_group_range(0) * warpsInBlock;
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+#pragma unroll 4
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)){
+        dbias_shared[i] = 0.0f;
+        dweight_shared[i] = 0.0f;
+    }
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
+    sycl::group_barrier(block);
+
+    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const floatX* dout_bt = dout + b * T * C + t * C;
+        const floatX* inp_bt = inp + b * T * C + t * C;
+        floatX* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warpThreadIdx; i < C; i  += warpSize) {
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+            dnorm_mean += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
+        dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
+
+        dnorm_mean = dnorm_mean / C;
+        dnorm_norm_mean = dnorm_norm_mean / C;
+
+        // now iterate again and accumulate all the gradients
+        for (int i = warpThreadIdx; i < C; i += warpSize) {
+            // Fix this later
+            float dout_i = (float)dout_bt[i];
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * dout_i;
+            // gradient contribution to bias
+            atomicAdd(&dbias_shared[i], dout_i);
+            // gradient contribution to weight
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
+            // gradient contribution to input
+            float dval = 0.0f;
+            dval += dnorm_i; // term 1
+            dval -= dnorm_mean; // term 2
+            dval -= norm_bti * dnorm_norm_mean; // term 3
+            dval *= rstd_bt; // final scale
+            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+        }
+    }
+
+    // Accumulate into a FP32 scratchpad
+    // BF16 atomics are potentially much slower... and this is more precise!
+    sycl::group_barrier(block);
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C;
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
+    for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
+        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
+    }
+    sycl::group_barrier(block);
+    if (id.get_local_id(0) == 0) {
+        *tmp_flag = atomicAdd(scratchFlag, (uint)1);
+    }
+    sycl::group_barrier(block);
+    if (*tmp_flag == id.get_group_range(0)-1) {
+        for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)) {
+            // todo - potentially do stochastic rounding here as well
+            dbias[i] = (floatX)scratch_dbias[i];
+            dweight[i] = (floatX)scratch_dweight[i];
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -272,6 +562,62 @@ void layernorm_backward2(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams*
     sycl::free(dbias_tmp, q);
 }
 
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward5(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int grid_size = 1 * max_CUs; // only support 1 block per SM for simplicity, 1024 threads is best anyway
+    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+    q.memset(scratch, 0, (grid_size * 2 * C + 1) * sizeof(float)).wait();
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> local_acc(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            layernorm_backward_kernel5(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, local_acc);
+        });
+    }).wait();
+}
+
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward6(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int grid_size = (1024/block_size) * max_CUs;
+    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+
+    // Including this as part of the timing until we can parallelise it
+    // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
+    q.memset(scratch, 0, (1 + 2 * C) * sizeof(float)).wait();
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> local_acc(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            layernorm_backward_kernel6(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, local_acc);
+        });
+    }).wait();
+}
+
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward7(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int grid_size = (1024/block_size) * max_CUs;
+    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+
+    // Including this as part of the timing until we can parallelise it
+    // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
+    q.memset(scratch, 0, (1 + 2 * C) * sizeof(float)).wait();
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> local_acc(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            layernorm_backward_kernel7(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, local_acc);
+        });
+    }).wait();
+}
+
 // kernel version dispatch
 void layernorm_backward(int kernel_num, sycl::queue &q,
                         floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -279,11 +625,22 @@ void layernorm_backward(int kernel_num, sycl::queue &q,
                         int B, int T, int C,
                         const int block_size) {
     switch (kernel_num) {
+#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         case 1:
             layernorm_backward1(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
+#endif
         case 2:
             layernorm_backward2(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 5:
+            layernorm_backward5(q, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 6:
+            layernorm_backward6(q, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 7:
+            layernorm_backward7(q, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         default:
             std::cout << "Invalid kernel number\n";
