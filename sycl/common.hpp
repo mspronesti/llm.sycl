@@ -7,12 +7,33 @@
 #include <cstdlib>
 #include <chrono>
 
+//  SYCL equivalent of CUDA atomics builtins
+//  ------------------------------------------------------------
 template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
 static inline T atomicAdd(T* val, const T delta)
 {
     sycl::atomic_ref<T, sycl::memory_order::relaxed,
     MemoryScope> ref(*val);
     return ref.fetch_add(delta);
+}
+
+// https://github.com/zjin-lcf/HeCBench/blob/aad74973f5ceb1e059829e46725f8dbd573cd546/src/bh-sycl/main.cpp#L79-L97
+template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
+T atomicInc(T* addr, unsigned int val) {
+    auto atm = sycl::atomic_ref<T,
+            sycl::memory_order::relaxed,
+            MemoryScope
+    >(addr[0]);
+    T old;
+    while (true) {
+        old = atm.load();
+        if (old >= val) {
+            if (atm.compare_exchange_strong(old, 0))
+                break;
+        } else if (atm.compare_exchange_strong(old, old + 1))
+            break;
+    }
+    return old;
 }
 
 // ----------------------------------------------------------------------------
@@ -28,6 +49,22 @@ struct alignas(16) Packed128 {
     explicit Packed128(sycl::int4 bits) {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         *reinterpret_cast<sycl::int4*>(payload) = bits;
+    }
+
+    static Packed128 constant(ElementType value) {
+        Packed128 result;
+        for(int k = 0; k < size; ++k) {
+            result.payload[k] = value;
+        }
+        return result;
+    }
+
+    static Packed128 zeros() {
+        return constant(0);
+    }
+
+    static Packed128 ones() {
+        return constant(1);
     }
 
     ElementType& operator[](int index) {
@@ -75,6 +112,12 @@ void store128(ElementType* target, Packed128<ElementType> value) {
 // store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 void store128cs(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
+}
+
+// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
+template<class ElementType>
+void store128cg(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
 }
 
