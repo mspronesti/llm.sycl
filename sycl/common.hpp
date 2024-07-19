@@ -36,6 +36,19 @@ T atomicInc(T* addr, unsigned int val) {
     return old;
 }
 
+//https://github.com/zjin-lcf/HeCBench/blob/aad74973f5ceb1e059829e46725f8dbd573cd546/src/cc-sycl/main.cpp#L56-L65
+template<typename T, sycl::memory_scope MemoryScope = sycl::memory_scope::device>
+inline T atomicCAS(T* addr, T expected, T desired)
+{
+    T expected_value = expected;
+    auto atm = sycl::atomic_ref<T,
+            sycl::memory_order::relaxed,
+            MemoryScope
+    >(*addr);
+    atm.compare_exchange_strong(expected_value, desired);
+    return expected_value;
+}
+
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)

@@ -8,7 +8,7 @@
 #define ENABLE_BF16
 #include "common.hpp"
 
-
+using bfloat162 = sycl::marray<sycl::ext::oneapi::bfloat16, 2>;
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -226,6 +226,118 @@ void copy_to_dweight_dbias(sycl::nd_item<1> id, int C, Tparams* dbias, Tparams* 
         dweight[i] = (Tparams)dweight_tmp[i];
     }
 }
+
+// atomicCAS version of kernel3
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward_kernel4(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                                const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                                int B, int T, int C, sycl::local_accessor<float> local_acc) {
+    float* shared = local_acc.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C
+
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int base_idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+    #pragma unroll 4
+    for(int i = id.get_local_id(0); i < C; i += id.get_local_range(0)){
+        dbias_shared[i] = 0.0f;
+        dweight_shared[i] = 0.0f;
+    }
+    id.barrier();
+
+    int warps_in_grid = id.get_group_range(0) * warp.get_group_linear_range();
+    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const Tdout* dout_bt = dout + b * T * C + t * C;
+        const Trest* inp_bt = inp + b * T * C + t * C;
+        Tdinp* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warp.get_local_linear_id(); i < C; i += warp.get_local_linear_range()) {
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+            dnorm_mean += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
+        dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
+        dnorm_mean = dnorm_mean / C;
+        dnorm_norm_mean = dnorm_norm_mean / C;
+
+        // now iterate again and accumulate all the gradients
+        for (int i = warp.get_local_linear_id(); i < C; i += warp.get_local_linear_range()) {
+            float dout_i = (float)dout_bt[i];
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * dout_i;
+            // gradient contribution to bias
+            atomicAdd(&dbias_shared[i], dout_i);
+            // gradient contribution to weight
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
+            // gradient contribution to input
+            float dval = 0.0f;
+            dval += dnorm_i; // term 1
+            dval -= dnorm_mean; // term 2
+            dval -= norm_bti * dnorm_norm_mean; // term 3
+            dval *= rstd_bt; // final scale
+            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+        }
+    }
+    id.barrier();
+
+    bfloat162* dbiasVec2 = reinterpret_cast<bfloat162*>(dbias);
+    bfloat162* dweightVec2 = reinterpret_cast<bfloat162*>(dweight);
+
+    // write to global memory
+    for(int i = id.get_local_id(0); i < C/2; i += id.get_local_range(0)) {
+        bfloat162 add_dbias = bfloat162(dbias_shared[i*2], dbias_shared[i*2+1]);
+        bfloat162 add_dweight = bfloat162(dweight_shared[i*2], dweight_shared[i*2+1]);
+
+        // Get the current value from L2 cache
+        bfloat162 current_dbias = dbiasVec2[i];
+        bfloat162 current_dweight = dweightVec2[i];
+
+        // Add the two values
+        bfloat162 new_dbias = add_dbias + current_dbias;
+        bfloat162 new_dweight = add_dweight + current_dweight;
+
+        // Write the result back to L2 cache using 32-bit integer atomic compare and exchange
+        unsigned int current_dbias32b = *reinterpret_cast<unsigned int*>(&current_dbias);
+        unsigned int current_dweight32b = *reinterpret_cast<unsigned int*>(&current_dweight);
+
+        unsigned int new_dbias32b = *reinterpret_cast<unsigned int*>(&new_dbias);
+        unsigned int new_dweight32b = *reinterpret_cast<unsigned int*>(&new_dweight);
+
+        unsigned int old_dbias32b = atomicCAS((unsigned int*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
+        unsigned int old_dweight32b = atomicCAS((unsigned int*)&dweightVec2[i], current_dweight32b, new_dweight32b);
+
+        // If the value has changed between read and atomic, we need to try again
+        while (old_dbias32b != current_dbias32b) {
+            current_dbias32b = old_dbias32b;
+            new_dbias = *reinterpret_cast<bfloat162*>(&current_dbias32b) + add_dbias;
+            new_dbias32b = *reinterpret_cast<unsigned int*>(&new_dbias);
+            old_dbias32b = atomicCAS((unsigned int*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
+        }
+
+        while (old_dweight32b != current_dweight32b) {
+            current_dweight32b = old_dweight32b;
+            new_dweight = *reinterpret_cast<bfloat162*>(&current_dweight32b) + add_dweight;
+            new_dweight32b = *reinterpret_cast<unsigned int*>(&new_dweight);
+            old_dweight32b = atomicCAS((unsigned int*)&dweightVec2[i], current_dweight32b, new_dweight32b);
+        }
+    }
+}
+
 
 // FP32 scratchpad per threadgroup, zero atomics except atomicAdd on uint for the flag (based on kernel3)
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
@@ -1074,6 +1186,21 @@ void layernorm_backward2(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams*
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward4(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+    int max_CUs = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int grid_size = (1024/block_size) * max_CUs;
+    size_t shared_mem_size = 2 * C * sizeof(float);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> local_acc(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            layernorm_backward_kernel4(id, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, local_acc);
+        });
+    }).wait();
+}
+
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward5(sycl::queue &q, Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                          const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                          int B, int T, int C, int block_size) {
@@ -1200,6 +1327,12 @@ void layernorm_backward(int kernel_num, sycl::queue &q,
         case 2:
             layernorm_backward2(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
+            // this kernel doesn't work on Intel GPUs
+/*#if defined(ENABLE_BF16)
+        case 4:
+            layernorm_backward4(q, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+#endif*/
         case 5:
             layernorm_backward5(q, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
