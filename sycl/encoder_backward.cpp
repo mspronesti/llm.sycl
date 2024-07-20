@@ -59,11 +59,8 @@ void encoder_backward_kernel1(sycl::nd_item<1> item,
         float* dwte_ix = dwte + ix * C + c;
         float* dwpe_tc = dwpe + t * C + c;
 
-        auto atomic_dwte = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwte_ix);
-        auto atomic_dwpe = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(*dwpe_tc);
-
-        atomic_dwte.fetch_add(*dout_btc);
-        atomic_dwpe.fetch_add(*dout_btc);
+        atomicAdd(dwte_ix, *dout_btc);
+        atomicAdd(dwpe_tc, *dout_btc);
     }
 }
 
