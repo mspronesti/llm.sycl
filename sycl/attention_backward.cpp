@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include "common.hpp"
 
+auto MKL_OP_T = oneapi::mkl::transpose::trans;
+auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -710,11 +713,9 @@ void attention_forward(sycl::queue &queue, float* out, float* vaccum, float* qkv
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            trans, no_trans,
+            MKL_OP_T, MKL_OP_N,
             T, T, HS,
             alpha,
             k, HS, T * HS,
@@ -737,7 +738,7 @@ void attention_forward(sycl::queue &queue, float* out, float* vaccum, float* qkv
     // vaccum = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, no_trans,
+            MKL_OP_N, MKL_OP_N,
             HS, T, T,
             alpha,
             v, HS, T * HS,
@@ -904,12 +905,10 @@ void attention_backward1(sycl::queue &queue, float* dinp, float* dqkvr, float* d
         unpermute_kernel_backward(id, dvaccum, dout, B, T, NH, HS);
     }).wait();
 
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     // backward into datt
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            trans, no_trans,
+            MKL_OP_T, MKL_OP_N,
             T, T, HS,
             &alpha,
             v, HS, T * HS,
@@ -922,7 +921,7 @@ void attention_backward1(sycl::queue &queue, float* dinp, float* dqkvr, float* d
     // backward into dv
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, trans,
+            MKL_OP_N, MKL_OP_T,
             HS, T, T,
             &alpha,
             dvaccum, HS, T * HS,
@@ -937,7 +936,7 @@ void attention_backward1(sycl::queue &queue, float* dinp, float* dqkvr, float* d
     // backward into q
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, no_trans,
+            MKL_OP_N, MKL_OP_N,
             HS, T, T,
             &alpha,
             k, HS, T * HS,
@@ -949,7 +948,7 @@ void attention_backward1(sycl::queue &queue, float* dinp, float* dqkvr, float* d
     // backward into k
     oneapi::mkl::blas::column_major::gemm_batch(
             queue,
-            no_trans, trans,
+            MKL_OP_N, MKL_OP_T,
             HS, T, T,
             &alpha,
             q, HS, T * HS,
@@ -1136,7 +1135,7 @@ int main(int argc, char **argv) {
 
         // attempt to index at random
         if (b == 1 && t == 5 && c == 23 && h == 2) {
-            printf("ix %5d [b=%4d, t=%4d, qkv=%4d, nh=%4d, hs=%4d]: ref: %f gpu: %f\n", i, b, t, qkvix, h, c, dinp[i], h_dinp[i]);
+            std::cout << "ix " << i << " [b=" << b << ", t=" << t << ", qkv=" << qkvix << ", nh=" << h << ", hs=" << c << "]: ref: " << dinp[i] << " gpu: " << h_dinp[i] << '\n';
         }
 
         if (diff > 1e-4f) {
@@ -1149,12 +1148,13 @@ int main(int argc, char **argv) {
             num_zero_grad++;
         }
     }
-    printf("Number of matching gradients: %d (%.2f%% of total)\n", num_match, 100*(float)num_match / (B * T * 3 * C));
-    printf("Number of non-matching gradients: %d (%.2f%% of total)\n", num_no_match, 100*(float)num_no_match / (B * T * 3 * C));
-    printf("Number of gradients that are exactly zero: %d (%.2f%% of total)\n", num_zero_grad, 100*(float)num_zero_grad / (B * T * 3 * C));
+
+    std::cout << "Number of matching gradients: " << num_match << " (" << 100*(float)num_match / (B * T * 3 * C) << "% of total)\n";
+    std::cout << "Number of non-matching gradients: " << num_no_match << " (" << 100*(float)num_no_match / (B * T * 3 * C) << "% of total)\n";
+    std::cout << "Number of gradients that are exactly zero: " << num_zero_grad << " (" << 100*(float)num_zero_grad / (B * T * 3 * C) << "% of total)\n";
 
     // final verdict
-    printf("All results match. Starting benchmarks.\n\n");
+    std::cout << "All results match. Starting benchmarks.\n\n";
 
     // benchmark speed of the kernel
     int block_sizes[] = {32, 64, 128, 256, 512};
@@ -1165,7 +1165,7 @@ int main(int argc, char **argv) {
                                               d_dout, d_inp, d_qkvr, d_preatt, d_att, d_vaccum,
                                               B, T, C, NH, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        std::cout << "block_size " << block_size << " | time " << elapsed_time << " ms\n";
     }
 
     // free memory
@@ -1179,6 +1179,7 @@ int main(int argc, char **argv) {
     free(dinp);
     free(dpreatt);
     free(datt);
+    free(h_dinp);
     sycl::free(d_inp, q);
     sycl::free(d_qkvr, q);
     sycl::free(d_preatt, q);
@@ -1191,6 +1192,7 @@ int main(int argc, char **argv) {
     sycl::free(d_datt, q);
     sycl::free(d_dvaccum, q);
     sycl::free(d_dout, q);
+
 
     return 0;
 }

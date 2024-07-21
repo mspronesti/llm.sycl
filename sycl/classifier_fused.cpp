@@ -616,7 +616,7 @@ int main(int argc, char **argv) {
     std::cout << "Using kernel " << kernel_num << '\n';
 
     // define block sizes we'll use in correctness and timing
-    int block_sizes[] = {32, 64, 128, 256};
+    int block_sizes[] = {32, 64, 128, 256, 512};
 
     // first check the correctness of the kernel
     softmax_forward_cpu(probs, logits, B * T, V);
@@ -657,6 +657,7 @@ int main(int argc, char **argv) {
     sycl::free(d_logits, q);
     sycl::free(d_dlosses, q);
     sycl::free(d_targets, q);
+    sycl::free(d_dlogits_no_pad, q);
 
     return 0;
 }

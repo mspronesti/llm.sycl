@@ -7,6 +7,9 @@
 #define ENABLE_BF16
 #include "common.hpp"
 
+auto MKL_OP_T = oneapi::mkl::transpose::trans;
+auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
+
 static bool first_run_validation = true; // always run e.g. permute on 1st run
 
 // ----------------------------------------------------------------------------
@@ -727,10 +730,8 @@ void attention_forward3(sycl::queue &queue, float* out, float* vaccum, float* qk
     // batched matrix multiply with oneMKL blas
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                trans, no_trans,
+                                                MKL_OP_T, MKL_OP_N,
                                                 T, T, HS,
                                                 &alpha,
                                                 k, HS, T * HS,
@@ -758,7 +759,7 @@ void attention_forward3(sycl::queue &queue, float* out, float* vaccum, float* qk
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                no_trans, no_trans,
+                                                MKL_OP_N, MKL_OP_N,
                                                 HS, T, T,
                                                 &alpha,
                                                 v, HS, T * HS,
@@ -798,10 +799,8 @@ void attention_forward4(sycl::queue &queue, float* out, float* vaccum, float* qk
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                trans, no_trans,
+                                                MKL_OP_T, MKL_OP_N,
                                                 T, T, HS,
                                                 &alpha,
                                                 k, HS, T * HS,
@@ -823,7 +822,7 @@ void attention_forward4(sycl::queue &queue, float* out, float* vaccum, float* qk
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                no_trans, no_trans,
+                                                MKL_OP_N, MKL_OP_N,
                                                 HS, T, T,
                                                 &alpha,
                                                 v, HS, T * HS,
@@ -870,10 +869,8 @@ void attention_forward5(sycl::queue &queue, float* out, floatX* vaccum, floatX* 
     const floatX beta_lowp = (floatX)beta;
 
     // batched matrix multiply with cuBLAS
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                trans, no_trans,
+                                                MKL_OP_T, MKL_OP_N,
                                                 T, T, HS,
                                                 alpha_lowp,
                                                 k, HS, T * HS,
@@ -894,7 +891,7 @@ void attention_forward5(sycl::queue &queue, float* out, floatX* vaccum, floatX* 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                                no_trans, no_trans,
+                                                MKL_OP_N, MKL_OP_N,
                                                 HS, T, T,
                                                 alpha_lowp,
                                                 v, HS, T * HS,
@@ -1032,6 +1029,9 @@ int main(int argc, char **argv) {
     sycl::free(d_preatt, q);
     sycl::free(d_att, q);
     sycl::free(d_inp, q);
+    sycl::free(d_qkvr, q);
+    sycl::free(d_vaccum, q);
+
 
     return 0;
 }
