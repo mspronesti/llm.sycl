@@ -4,12 +4,21 @@ Triangular matrix multiplication as in autoregressive attention. A short story.
 */
 
 #include <sycl/sycl.hpp>
-#include <oneapi/mkl.hpp>
 #include <iostream>
 #include <cmath>
 #include <cassert>
 
+#define ENABLE_ONEDNN
 #include "common.hpp"
+
+#ifdef ENABLE_ONEDNN
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+#else
+#include <oneapi/mkl.hpp>
+auto MKL_OP_T = oneapi::mkl::transpose::trans;
+auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
+#endif
 
 static float* d_qkvr;   // scratch for the onemkl blas kernel
 
@@ -285,8 +294,8 @@ void matmul_tri4(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, 
     }
 }
 
-// (oneMKL)blas version
-void trimul_onemkl(sycl::queue &queue, float* preatt,
+// oneDNN or oneMKL blas version
+void trimul_blas(sycl::queue &queue, float* preatt,
                    const float* inp,
                    int B, int T, int C, int NH) {
     int HS = C / NH; // head size
@@ -301,7 +310,7 @@ void trimul_onemkl(sycl::queue &queue, float* preatt,
     // Launch SYCL kernel for permutation
     queue.parallel_for(sycl::nd_range<1>(num_blocks * 256, 256), [=](sycl::nd_item<1> id) {
         permute_kernel(id, q, k, v, inp, B, T, NH, HS);
-    }).wait();
+    });
 
 
     const float alpha = 1.0f / std::sqrt(HS);
@@ -335,9 +344,38 @@ void trimul_onemkl(sycl::queue &queue, float* preatt,
     // qT.dot(k1) qT.dot(k2) ... qT.dot(kT)
     // -----------------------------------
     // which is exactly what we wanted! :)
-    auto MKL_OP_T = oneapi::mkl::transpose::trans;
-    auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
     // this takes far more than expected though ...
+#ifdef ENABLE_ONEDNN
+    auto engine = dnnl::sycl_interop::make_engine(queue.get_device(), queue.get_context());
+    auto stream = dnnl::sycl_interop::make_stream(engine, queue);
+
+    // Memory descriptors
+    auto q_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::abc);
+    auto k_md = dnnl::memory::desc({B * NH, HS, T}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::acb);
+    auto preatt_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::abc);
+
+    // Memory objects
+    auto q_mem = dnnl::sycl_interop::make_memory(q_md, engine, dnnl::sycl_interop::memory_kind::usm, q);
+    auto k_mem = dnnl::sycl_interop::make_memory(k_md, engine, dnnl::sycl_interop::memory_kind::usm, k);
+    auto preatt_mem = dnnl::sycl_interop::make_memory(preatt_md, engine, dnnl::sycl_interop::memory_kind::usm, preatt);
+
+    dnnl::primitive_attr matmul_attr;
+
+    // Primitive descriptor
+    auto matmul_pd = dnnl::matmul::primitive_desc(engine, q_md, k_md, preatt_md, matmul_attr);
+
+    // Matmul primitive
+    auto matmul_prim = dnnl::matmul(matmul_pd);
+
+    // Run matmul
+    matmul_prim.execute(stream, {
+        {DNNL_ARG_SRC, q_mem},
+        {DNNL_ARG_WEIGHTS, k_mem},
+        {DNNL_ARG_DST, preatt_mem}
+    });
+
+    stream.wait();
+#else
     oneapi::mkl::blas::column_major::gemm_batch(queue,
                                              MKL_OP_T, MKL_OP_N,
                                              T, T, HS,
@@ -347,6 +385,7 @@ void trimul_onemkl(sycl::queue &queue, float* preatt,
                                              beta,
                                              preatt, T, T * T,
                                              B * NH);
+#endif
 }
 
 
@@ -433,7 +472,7 @@ void trimul_gpu(int kernel_num,
                 int B, int T, int C, int NH) {
     switch (kernel_num) {
         case 0:
-            trimul_onemkl(q, out, inp, B, T, C, NH);
+            trimul_blas(q, out, inp, B, T, C, NH);
         case 1:
             trimul_launcher<matmul_tri_naive>(q, out, inp, B, T, C, NH);
             break;
@@ -501,14 +540,14 @@ int main(int argc, char **argv) {
             kernel_num, q, d_out, d_inp, B, T, C, NH
     );
 
-    float onemkl_blas_time = benchmark_kernel(
+    float blas_time = benchmark_kernel(
         repeat_times,
         trimul_gpu,
         0, // kernel 0 == oneMKL blas kernel
         q, d_out, d_inp, B, T, C, NH
     );
 
-    std::cout << "time " << elapsed_time << " ms vs " << onemkl_blas_time << " ms for oneMKL Blas\n";
+    std::cout << "time " << elapsed_time << " ms vs " << blas_time << " ms for blas\n";
 
     // free memory
     free(out);
