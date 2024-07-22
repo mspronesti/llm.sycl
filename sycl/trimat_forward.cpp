@@ -202,6 +202,88 @@ void matmul_tri3(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, 
     }
 }
 
+void matmul_tri4(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha,
+                 sycl::multi_ptr<float[128][32][2], sycl::access::address_space::local_space> local_acc) {
+
+    // thread indices in "cuda style"
+    int threadIdx_x = id.get_local_id(2);
+    int threadIdx_y = id.get_local_id(1);
+    int blockIdx_x = id.get_group(2);
+    int blockIdx_y = id.get_group(1);
+
+    int i_base = 128 * blockIdx_x + 8 * threadIdx_x;
+    int j_base = 128 * blockIdx_y + 8 * threadIdx_y;
+
+    // we need all threads for loading data, so none of them can chicken out early, even
+    // if they are not responsible for any useful result.
+    if (blockIdx_y > blockIdx_x)
+        return;
+
+    q += 128 * blockIdx_x * QS;
+    k += 128 * blockIdx_y * KS;
+
+    float *shared = (float*) local_acc.get_raw();
+    float (*lhs_s)[32] = (float (*)[32]) shared;
+    float (*rhs_s)[32] = (float (*)[32]) (shared + 128 * 32);
+
+    float vals[8][8] = {};
+    for (int so = 0; so < HS; so += 32) {
+        // Read a large slice of the input, worked on together by all threads.
+        // They are organized differently for this part. We want to ensure
+        // fully coalesced loads, so we let a single warp handle consecutive
+        // addresses, which means we need to combine two threadIdx.y values
+        // in one read operation.
+        // note: threads may read data here that they don't need themselves.
+        //       this really is a block-level operation.
+        // note2: 16x16 threads (i.e. the block) will, through this for loop, fetch 32 dims from 128 keys and 128 queries
+        // i.e. from Q/K, of shape (T, HS) take q[:128, so*32:(so+1)*32] and k[:128, so*32:(so+1)*32]
+        sycl::group_barrier(id.get_group());
+        for(int y = threadIdx_y / 2; y < 128; y += 8) {
+            int xo = (threadIdx_y % 2) * 16;
+            lhs_s[y][threadIdx_x + xo] = q[y * QS + so + threadIdx_x + xo];
+            rhs_s[y][threadIdx_x + xo] = k[y * KS + so + threadIdx_x + xo];
+        }
+        sycl::group_barrier(id.get_group());
+
+        // Now we compute a partial dot product (only 32 dims) for all combinations of keys and queries (128x128).
+        // Each thread does 8x8 of these partial dot products.
+        // E.g. thread (0,0) covers queries 0-7 and keys 0-7. More generally first row of threads
+        // (0,:) covers queries 0-7 with keys 0-127 and so on.
+        // In the next iterations of the outer (`so`) loop we'll be accumulating values to `vals` until we
+        // get the full dot product. We then later deposit it into the output matrix for all 8x8 blocks
+        // that are below the diagonal.
+        for (int si = 0; si < 32; ++si) {
+            float rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = rhs_s[u + 8 * threadIdx_y][(si + threadIdx_x) % 32];
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float lhs = lhs_s[ii + 8 * threadIdx_x][(si + threadIdx_x) % 32];
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs * rhs[ji];
+                }
+            }
+        }
+    }
+
+    // don't write above the diagonal
+    if (j_base > i_base)
+        return;
+
+    for (int ii = 0; ii < 8; ++ii) {
+        for (int ji = 0; ji < 8; ji += 4) {
+            int i = i_base + ii;
+            int j = j_base + ji;
+            sycl::float4 result;
+            result.x() = vals[ii][ji + 0] * alpha;
+            result.y() = vals[ii][ji + 1] * alpha;
+            result.z() = vals[ii][ji + 2] * alpha;
+            result.w() = vals[ii][ji + 3] * alpha;
+            st_vec(p + i * PS + j, result);
+        }
+    }
+}
 
 // (oneMKL)blas version
 void trimul_onemkl(sycl::queue &queue, float* preatt,
@@ -253,11 +335,11 @@ void trimul_onemkl(sycl::queue &queue, float* preatt,
     // qT.dot(k1) qT.dot(k2) ... qT.dot(kT)
     // -----------------------------------
     // which is exactly what we wanted! :)
-    auto trans = oneapi::mkl::transpose::trans;
-    auto no_trans = oneapi::mkl::transpose::nontrans;
+    auto MKL_OP_T = oneapi::mkl::transpose::trans;
+    auto MKL_OP_N = oneapi::mkl::transpose::nontrans;
     // this takes far more than expected though ...
     oneapi::mkl::blas::column_major::gemm_batch(queue,
-                                             trans, no_trans,
+                                             MKL_OP_T, MKL_OP_N,
                                              T, T, HS,
                                              alpha,
                                              k, HS, T * HS,
@@ -290,20 +372,57 @@ void trimul_launcher(sycl::queue &queue, float* out, const float* inp, int B, in
 
         // set up indices
         int C3 = C * 3;
-        int hs = C / NH; // head size
-        float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+        int HS = C / NH; // head size
+        float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
 
         // we put the "batch x head" dimension into the z block index.
-        int h = id.get_group(0) % NH;
         int b = id.get_group(0) / NH;
+        int nh = id.get_group(0) % NH;
 
         // Get the base address for the current batch and head
-        const float *q = inp + b * T * C3 + h * hs;
-        const float *k = inp + b * T * C3 + h * hs + C;
-        float *r = out + (b * NH + h) * T * T;
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
-        matmul_tri(id, r, T, k, C3, q, C3, T, hs, scale);
+        matmul_tri(id, r, T, k, C3, q, C3, T, HS, scale);
     }).wait();
+}
+
+// Identical to the above `trimul_launcher`, but copes with the different
+// prototype of the `matmul_tri4` function.
+// TODO: find a way to avoid this code duplication.
+void trimul_launcher_matmul_tri4(sycl::queue &q, float* out, const float* inp, int B, int T, int C, int NH) {
+    // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
+    // wouldn't want to use anyway.
+    assert(T % 128 == 0);
+    // No need to ceil_div, if it's not a multiple of 128, we would get wrong results anyway.
+    sycl::range<3> grid_dim(NH * B, T / 128, T / 128);
+    sycl::range<3> block_dim(1, 16, 16);
+    q.parallel_for(sycl::nd_range<3>(grid_dim * block_dim, block_dim), [=](sycl::nd_item<3> id) {
+        // skip above the diagonal
+        if (id.get_group(1) > id.get_group(2))
+            return;
+
+       // set up indices
+       int C3 = C*3;
+       int HS = C / NH; // head size
+       float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
+
+        // we put the "batch x head" dimension into the z block index.
+        int b = id.get_group(0) / NH;
+        int nh = id.get_group(0) % NH;
+
+        // Get the base address for the current batch and head
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
+
+       auto local_acc = sycl::ext::oneapi::group_local_memory_for_overwrite<float[128][32][2]>(
+               id.get_group());
+       matmul_tri4(id, r, T, k, C3, q, C3, T, HS, scale, local_acc);
+   }).wait();
 }
 
 // ----------------------------------------------------------------------------
@@ -323,6 +442,9 @@ void trimul_gpu(int kernel_num,
             break;
         case 3:
             trimul_launcher<matmul_tri3>(q, out, inp, B, T, C, NH);
+            break;
+        case 4:
+            trimul_launcher_matmul_tri4(q, out, inp, B, T, C, NH);
             break;
         default:
             std::cout << "Invalid kernel number\n";
