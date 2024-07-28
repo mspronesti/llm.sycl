@@ -20,7 +20,6 @@ jobs:
               ippcp
               mkl
               tbb
-              vpl
         - name: Setup vars
           run: |
             source /opt/intel/oneapi/setvars.sh
