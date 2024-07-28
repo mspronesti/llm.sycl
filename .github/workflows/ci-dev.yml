@@ -21,9 +21,13 @@ jobs:
               mkl
               tbb
 
+        - name: Setup environment
+          run: |
+            source /opt/intel/oneapi/setvars.sh
+            printenv >> $GITHUB_ENV
+
         - name: Build kernels
           run:  |
-            source /opt/intel/oneapi/setvars.sh
             cd dev/sycl
             # Use the Intel DPC++ compiler (icpx) and run make
             make CC=icx 
