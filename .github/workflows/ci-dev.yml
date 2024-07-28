@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   setup:
       runs-on: ubuntu-latest
-      name: Install OneAPI tools
+      name: Run all kernels (CPU)
       steps:
         - uses: actions/checkout@v3
         - uses: rscohn2/setup-oneapi@v0
@@ -30,7 +30,6 @@ jobs:
 
         - name: Run kernels
           run: |
-            source /opt/intel/oneapi/setvars.sh
             cd dev/sycl
             make run_all CC=icx
 
