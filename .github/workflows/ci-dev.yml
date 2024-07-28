@@ -1,0 +1,34 @@
+name: oneAPI-build
+
+on: [push, pull_request]
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    name: Run all kernels (CPU)
+    steps:
+      - uses: actions/checkout@v3
+      - uses: rscohn2/setup-oneapi@v0
+        with:
+          list: true
+          components: |
+            icx
+            ifx
+            ccl
+            dnn
+            dpl
+            ippcp
+            mkl
+            tbb
+      - name: Setup variables
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          printenv >> $GITHUB_ENV
+      - name: Build kernels
+        run:  |
+          cd dev/sycl
+          make CC=icx
+      - name: Run kernels
+        run: |
+          cd dev/sycl
+          make run_all CC=icx
