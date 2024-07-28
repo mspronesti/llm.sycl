@@ -29,8 +29,9 @@ inline float lerp(float start, float end, float weight) {
 }
 
 // naive fused kernel
-void adamw_kernel1(sycl::id<1> i, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+void adamw_kernel1(sycl::nd_item<1> id, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay){
+    int i = id.get_global_id(0);
     if (i >= num_parameters) return;  // guard
     // update the first moment (momentum)
     d_m_memory[i] = beta1 * d_m_memory[i] + (1.0f - beta1) * d_grads[i];
@@ -43,8 +44,9 @@ void adamw_kernel1(sycl::id<1> i, float* d_params, const float* d_grads, float* 
 
 
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
-void adamw_kernel2(sycl::id<1> i, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
+void adamw_kernel2(sycl::nd_item<1> id, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
                    long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    int i = id.get_global_id(0);
     if (i >= num_parameters) return;  // guard
     float grad = d_grads[i];
     float m = d_m_memory[i];
@@ -62,8 +64,10 @@ void adamw_kernel2(sycl::id<1> i, float* d_params, const float* d_grads, float* 
 
 
 void adamw_dispatch1(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
-                   long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    q.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> id) {
+                     long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         adamw_kernel1(id, d_params, d_grads, d_m_memory, d_v_memory, num_parameters, learning_rate,
                       beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     });
@@ -71,10 +75,12 @@ void adamw_dispatch1(sycl::queue& q, float* d_params, const float* d_grads, floa
 
 // Slightly more optimized AdamW kernel by using optimized linear interpolation for the moment updates.
 void adamw_dispatch2(sycl::queue& q, float* d_params, const float* d_grads, float* d_m_memory, float* d_v_memory,
-                   long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    q.parallel_for(sycl::range<1>(num_parameters), [=](sycl::id<1> id) {
-        adamw_kernel2(id, d_params, d_grads, d_m_memory, d_v_memory,
-                num_parameters, learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+                     long num_parameters, float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+        adamw_kernel2(id, d_params, d_grads, d_m_memory, d_v_memory, num_parameters, learning_rate,
+                      beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     });
 
 }
@@ -89,11 +95,11 @@ void adamw(int kernel_num, sycl::queue &q,
     switch (kernel_num) {
         case 1:
             adamw_dispatch1(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
-                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         case 2:
             adamw_dispatch2(q, d_params, d_grads, d_m_memory, d_v_memory, num_parameters,
-                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
             std::cerr << "Invalid kernel number" << std::endl;
@@ -163,11 +169,11 @@ int main(int argc, char** argv) {
     // benchmark the kernel
     int repeat_times = 1000;
     float elapsed_time = benchmark_kernel(
-        repeat_times,
-        adamw,
-        kernel_num, q,
-        d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
-        learning_rate, beta1, beta2, eps, weight_decay
+            repeat_times,
+            adamw,
+            kernel_num, q,
+            d_params, d_grads, d_m_memory, d_v_memory, t, num_parameters,
+            learning_rate, beta1, beta2, eps, weight_decay
     );
 
     std::cout << "time gpu " << elapsed_time << " ms" << std::endl;
@@ -187,4 +193,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-

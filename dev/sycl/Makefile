@@ -27,6 +27,9 @@ ifeq ($(HIP),yes)
     CFLAGS += -fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=$(HIP_ARCH)
 endif
 
+TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward global_norm layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward residual_forward  trimat_forward fused_residual_forward
+
+all: $(TARGETS)
 
 matmul_forward: matmul_forward.cpp
 	$(CC) $(CFLAGS) $< -ldnnl -o $@
@@ -38,7 +41,15 @@ trimat_forward: trimat_forward.cpp
 %: %.cpp
 	$(CC) $(CFLAGS) $< -o $@
 
+# Run all targets
+run_all: all
+	@for target in $(TARGETS); do \
+		echo "\n========================================"; \
+		echo "Running $$target ..."; \
+		echo "========================================\n"; \
+		./$$target; \
+	done
+
 .PHONY: clean
 clean:
 	rm -f $(wildcard *.o) $(wildcard main)
-
