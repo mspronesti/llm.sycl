@@ -4,8 +4,8 @@ on: [push, pull_request]
 
 jobs:
   setup:
-      runs-on: ubuntu-latest
-      name: Setup OneAPI environment
+      runs-on: [ubuntu-latest, windows-latest]
+      name: Run all kernels (CPU)
       steps:
         - uses: actions/checkout@v3
         - uses: rscohn2/setup-oneapi@v0
@@ -26,20 +26,14 @@ jobs:
             source /opt/intel/oneapi/setvars.sh
             printenv >> $GITHUB_ENV
 
-  run_kernels:
-      name: Run all kernels (CPU)
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v3
         - name: Build kernels
-          run: |
+          run:  |
             cd dev/sycl
-            make CC=icx
+            make CC=icx 
 
         - name: Run kernels
           run: |
             cd dev/sycl
             make run_all CC=icx
-
 
     
