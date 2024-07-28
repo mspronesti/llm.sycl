@@ -20,17 +20,17 @@ jobs:
               ippcp
               mkl
               tbb
-        - name: Setup vars
-          run: |
-            source /opt/intel/oneapi/setvars.sh
+
         - name: Build kernels
           run:  |
+            source /opt/intel/oneapi/setvars.sh
             cd dev/sycl
             # Use the Intel DPC++ compiler (icpx) and run make
             make CC=icx 
 
         - name: Run kernels
           run: |
+            source /opt/intel/oneapi/setvars.sh
             cd dev/sycl
             make run_all CC=icx
 
