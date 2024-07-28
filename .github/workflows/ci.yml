@@ -12,8 +12,13 @@ jobs:
           with:
             list: true
             components: |
-              icx
-              vpl
+              - ccl
+              - dnn
+              - dpl
+              - ippcp
+              - tbb
+              - vpl
+              - mkl
         - name: Setup vars
           run: |
             source /opt/intel/oneapi/setvars.sh
