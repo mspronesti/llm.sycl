@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   setup:
       runs-on: ubuntu-latest
-      name: Run all kernels (CPU)
+      name: Setup OneAPI environment
       steps:
         - uses: actions/checkout@v3
         - uses: rscohn2/setup-oneapi@v0
@@ -21,20 +21,25 @@ jobs:
               mkl
               tbb
 
-        - name: Setup environment
+        - name: Setup variables
           run: |
             source /opt/intel/oneapi/setvars.sh
             printenv >> $GITHUB_ENV
 
+  run_kernels:
+      name: Run all kernels (CPU)
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v3
         - name: Build kernels
-          run:  |
+          run: |
             cd dev/sycl
-            # Use the Intel DPC++ compiler (icpx) and run make
-            make CC=icx 
+            make CC=icx
 
         - name: Run kernels
           run: |
             cd dev/sycl
             make run_all CC=icx
+
 
     
