@@ -23,15 +23,15 @@ jobs:
         - name: Setup vars
           run: |
             source /opt/intel/oneapi/setvars.sh
-        - name: Build all kernels
+        - name: Build kernels
           run:  |
             cd dev/sycl
             # Use the Intel DPC++ compiler (icpx) and run make
-            make CC=icpx 
+            make CC=icx 
 
-        - name: run all kernels
+        - name: Run kernels
           run: |
             cd dev/sycl
-            make run_all CC=icpx
+            make run_all CC=icx
 
     
