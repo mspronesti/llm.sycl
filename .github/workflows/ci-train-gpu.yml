@@ -1,0 +1,28 @@
+name: GPU Train and Test
+
+on: [push, pull_request]
+
+jobs:
+  train-and-test-gpu:
+    runs-on: devcloud # self-hosted GPU runner on Intel devcloud
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download starter pack (initial weights)
+        run: |
+          chmod u+x ./download_starter_pack.sh
+          ./download_starter_pack.sh
+
+      - name: Compile training and testing program
+        run: |
+          make train_gpt2_fp32 test_gpt2_fp32
+
+      - name: Train model fp32
+        run: |
+          ./train_gpt2_fp32
+
+      - name: Test model fp32
+        run: |
+          ./test_gpt2_fp32

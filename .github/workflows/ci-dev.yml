@@ -1,14 +1,31 @@
-name: oneAPI-build
+name: CI kernels
 
 on: [push, pull_request]
 
 jobs:
-  setup:
+  gpu:
+    runs-on: devcloud # self-hosted GPU runner on Intel devcloud
+    name: Run all kernels (GPU)
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build kernels (GPU)
+        run:  |
+          cd dev/sycl
+          make CC=icx
+
+      - name: Run kernels (GPU)
+        run: |
+          cd dev/sycl
+          make run_all CC=icx
+
+  cpu:
     runs-on: ubuntu-latest
     name: Run all kernels (CPU)
     steps:
       - uses: actions/checkout@v3
-      - uses: rscohn2/setup-oneapi@v0
+      - name: Install OneAPI
+        uses: rscohn2/setup-oneapi@v0
         with:
           list: true
           components: |
@@ -20,15 +37,18 @@ jobs:
             ippcp
             mkl
             tbb
+
       - name: Setup variables
         run: |
           source /opt/intel/oneapi/setvars.sh
           printenv >> $GITHUB_ENV
-      - name: Build kernels
+
+      - name: Build kernels (CPU)
         run:  |
           cd dev/sycl
           make CC=icx
-      - name: Run kernels
+
+      - name: Run kernels (CPU)
         run: |
           cd dev/sycl
           make run_all CC=icx
