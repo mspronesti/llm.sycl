@@ -63,19 +63,19 @@ void encoder_forward_kernel3(sycl::nd_item<1> id, sycl::float4* out, const int* 
     int idx = id.get_global_id(0);
     int N = B * T * C4;
     if (idx < N) {
-    int bt = idx / C4;
-    int b = bt / T;
-    int t = bt % T;
-    int c4 = idx % C4;
-    int ix = inp[b * T + t];
+        int bt = idx / C4;
+        int b = bt / T;
+        int t = bt % T;
+        int c4 = idx % C4;
+        int ix = inp[b * T + t];
         out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
     }
 }
 
 // really bad naive kernel with atomicAdd
 void encoder_backward_kernel(sycl::nd_item<1> id, float* dwte, float* dwpe,
-                                        const float* dout, const int* inp,
-                                        int B, int T, int C) {
+                             const float* dout, const int* inp,
+                             int B, int T, int C) {
     int idx = id.get_global_id(0);
     int N = B * T * C;
 
@@ -382,7 +382,7 @@ void layernorm_backward_kernel2(sycl::nd_item<1> id, float* dinp, float* dweight
     float* dweight_shared = shared + C;
 
     // init shared memory to zero
-    #pragma unroll
+#pragma unroll
     for(int i = id.get_local_id(0); i < C; i+= id.get_local_range(0)){
         dbias_shared[i] = 0.0f;
         dweight_shared[i] = 0.0f;
@@ -429,9 +429,9 @@ void layernorm_backward_kernel2(sycl::nd_item<1> id, float* dinp, float* dweight
 }
 
 void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id,
-                                             float* block_acc,
-                                             float* dpreatt, const float* datt, const float* att,
-                                             int B, int T, int C, float scale) {
+                                            float* block_acc,
+                                            float* dpreatt, const float* datt, const float* att,
+                                            int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
     sycl::group block = id.get_group();
@@ -480,7 +480,7 @@ inline float lerp(float start, float end, float weight) {
     return sycl::fma(weight, end, sycl::fma(-weight, start, start));
 }
 
-void adamw_kernel2(sycl::nd_item<1> id, float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+/*void adamw_kernel2(sycl::nd_item<1> id, float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                    float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     int i = id.get_global_id(0);
     if (i >= num_parameters) return;  // guard
@@ -496,6 +496,23 @@ void adamw_kernel2(sycl::nd_item<1> id, float* params_memory, float* grads_memor
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat
     params_memory[i] -= learning_rate * (m / (sycl::sqrt(v) + eps) + weight_decay * params_memory[i]);
+}*/
+// the above kernel has some fp precision issues, so weights are never updated. Falling back to the CPU version
+void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    for (long i = 0; i < num_parameters; i++) {
+        float param = params_memory[i];
+        float grad = grads_memory[i];
+
+        float m = beta1 * m_memory[i] + (1.0f - beta1) * grad;
+        float v = beta2 * v_memory[i] + (1.0f - beta2) * grad * grad;
+        float m_hat = m / beta1_correction;
+        float v_hat = v / beta2_correction;
+
+        m_memory[i] = m;
+        v_memory[i] = v;
+        params_memory[i] -= learning_rate * (m_hat / (std::sqrt(v_hat) + eps) + weight_decay * param);
+    }
 }
 
 struct SoftmaxParams {
@@ -615,8 +632,8 @@ void add_bias(sycl::nd_item<1> id, float* out, const float* bias, int B, int T, 
 // NOTE: kernel 4 was very slow on Intel GPUs. Opted for kernel 2 instead.
 // handwritten, relatively efficient non-tensorcore matmul kernel
 void matmul_forward(sycl::queue &q, float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC) {
+                    const float* inp, const float* weight, const float* bias,
+                    int B, int T, int C, int OC) {
     // for reference API is:
     // cublasStatus_t cublasSgemm(cublasHandle_t handle,
     //                        cublasOperation_t transa, cublasOperation_t transb,
@@ -863,7 +880,7 @@ void attention_backward(sycl::queue &queue, float* dinp, float* dqkvr, float* dp
     int hs = C / NH; // head size
     const float scale = 1.0f / sqrtf((float)HS);
     queue.parallel_for(sycl::nd_range<2>(sycl::range<2>(B * NH, (T / 4) * 256),
-                                           sycl::range<2>(1, 256)), [=](sycl::nd_item<2> id) {
+                                         sycl::range<2>(1, 256)), [=](sycl::nd_item<2> id) {
         auto l_mem_ptr = (float*)sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
                 id.get_group()).get_raw();
         softmax_autoregressive_backward_kernel(id, l_mem_ptr, dpreatt, datt, att, B, T, C, scale);
@@ -970,7 +987,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(sycl::queue &q, ParameterTensors* params, size_t* param_sizes, int on_device) {
+float* malloc_and_point_parameters(sycl::queue &q, ParameterTensors* params, size_t* param_sizes, bool on_device) {
     // on_device: 0 = CPU, 1 = GPU
     // calculate the number of parameters
     size_t num_parameters = 0;
@@ -1121,8 +1138,10 @@ typedef struct {
     ParameterTensors grads;
     float* grads_memory;
     // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
+    float* m_memory_cpu;
+    float* v_memory_cpu;
+    float* grads_memory_cpu;
+    float* params_memory_cpu;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
@@ -1174,20 +1193,20 @@ void gpt2_build_from_checkpoint(sycl::queue &q, GPT2 *model, const char* checkpo
     model->num_parameters = num_parameters;
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(q, &model->params, model->param_sizes, 1);
+    model->params_memory = malloc_and_point_parameters(q, &model->params, model->param_sizes, true);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    q.memcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float)).wait();
-    free(params_memory_cpu);
+    model->params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
+    freadCheck(model->params_memory_cpu, sizeof(float), num_parameters, model_file);
+    q.memcpy(model->params_memory, model->params_memory_cpu, num_parameters * sizeof(float)).wait();
     fcloseCheck(model_file);
 
     // other inits
     model->acts_memory = nullptr;
     model->grads_memory = nullptr;
-    model->m_memory = nullptr;
-    model->v_memory = nullptr;
+    model->grads_memory_cpu = nullptr;
+    model->m_memory_cpu = nullptr;
+    model->v_memory_cpu = nullptr;
     model->grads_acts_memory = nullptr;
     model->inputs = nullptr;
     model->targets = nullptr;
@@ -1349,10 +1368,11 @@ void gpt2_backward(GPT2 *model, sycl::queue &q) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == nullptr) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(q, &model->grads, model->param_sizes, 1);
+        model->grads_memory = malloc_and_point_parameters(q, &model->grads, model->param_sizes, true);
+        model->grads_memory_cpu = (float*)mallocCheck(model->num_parameters * sizeof(float));
         printf("allocated %zu MiB for parameter gradients\n", (model->num_parameters * sizeof(float)) >> 20);
         // we're going to be clever for the activations backward pass. we don't need to exactly
-        // mirror the forward pass acrtivations and we will save memory.
+        // mirror the forward pass activations, and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
         GPT2Config cfg = model->config;
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
@@ -1465,37 +1485,49 @@ void gpt2_backward(GPT2 *model, sycl::queue &q) {
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, sycl::queue &q) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
-    // lazily allocate the memory for m_memory and v_memory
-    if (model->m_memory == nullptr) {
-        model->m_memory = sycl::malloc_device<float>(model->num_parameters, q);
-        model->v_memory = sycl::malloc_device<float>(model->num_parameters, q);
-        q.memset(model->m_memory, 0, model->num_parameters * sizeof(float)).wait();
-        q.memset(model->v_memory, 0, model->num_parameters * sizeof(float)).wait();
+    // lazily allocate the memory for m_memory and v_memory (on the CPU)
+    if (model->m_memory_cpu == nullptr) {
+        model->m_memory_cpu = (float*)mallocCheck(model->num_parameters * sizeof(float));
+        model->v_memory_cpu = (float*)mallocCheck(model->num_parameters * sizeof(float));
+        memset(model->m_memory_cpu, 0, model->num_parameters * sizeof(float));
+        memset(model->v_memory_cpu, 0, model->num_parameters * sizeof(float));
         printf("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
         printf("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
     }
 
-    int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+    // int block_size = 512;
+    // int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+
+    q.memcpy(model->params_memory_cpu, model->params_memory, model->num_parameters * sizeof(float)).wait();
+    q.memcpy(model->grads_memory_cpu, model->grads_memory, model->num_parameters * sizeof(float)).wait();
+
+
+/*    q.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         adamw_kernel2(id, model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
                       model->num_parameters,
                       learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
-    });
+    });*/
+    adamw_cpu(model->params_memory_cpu, model->grads_memory_cpu, model->m_memory_cpu, model->v_memory_cpu, model->num_parameters,
+              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+
+    q.memcpy(model->params_memory, model->params_memory_cpu, model->num_parameters * sizeof(float)).wait();
 }
 
 void gpt2_free(GPT2 *model, sycl::queue &q) {
     sycl::free(model->params_memory, q);
     sycl::free(model->grads_memory, q);
-    sycl::free(model->m_memory, q);
-    sycl::free(model->v_memory, q);
     sycl::free(model->acts_memory, q);
     sycl::free(model->grads_acts_memory, q);
     sycl::free(model->inputs, q);
     sycl::free(model->targets, q);
     sycl::free(model->cpu_losses, q);
+    // adamW CPU buffers
+    free(model->m_memory_cpu);
+    free(model->v_memory_cpu);
+    free(model->grads_memory_cpu);
+    free(model->params_memory_cpu);
 }
 
 #ifndef TESTING
@@ -1598,7 +1630,7 @@ int main(int argc, char *argv[]) {
     float learning_rate = 3e-4f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
-    int sample_every = 20; // every how many steps to do inference?
+    int sample_every = 20; // every how many steps to make inference?
     int genT = 64; // number of steps of inference we will do
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -1633,7 +1665,7 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
-    sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
+    sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order());
 
     printf("| device                | %-50s |\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1746,8 +1778,9 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, q);
         gpt2_zero_grad(&model, q);
         gpt2_backward(&model, q);
+        q.wait(); // we don't do any GPU computing (unfortunately) in  the update step,
+        // so we need to wait here.
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, q);
-        q.wait();
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
