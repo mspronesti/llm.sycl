@@ -27,12 +27,15 @@ ifeq ($(HIP),yes)
     CFLAGS += -fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=$(HIP_ARCH)
 endif
 
-TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward global_norm layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward residual_forward  trimat_forward fused_residual_forward
+TARGETS = $(patsubst %.cpp,%,$(wildcard *.cpp))
 
 all: $(TARGETS)
 
 matmul_forward: matmul_forward.cpp
 	$(CC) $(CFLAGS) $< -ldnnl -o $@
+
+softmax_forward: softmax_forward.cpp
+	$(CC) $(CFLAGS) $< -fp-model=precise -o $@
 
 trimat_forward: trimat_forward.cpp
 	$(CC) $(CFLAGS) $< -ldnnl -o $@
