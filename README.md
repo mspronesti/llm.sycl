@@ -14,12 +14,12 @@ make train_gpt2_fp32
 
 ### Quick start (single kernels)
 
-The `sycl` directory contains a number of standalone kernels that can be compiled and run independently. These are the building blocks of the full model and the `train_*` files.
+The `dev/sycl` directory contains a number of standalone kernels that can be compiled and run independently. These are the building blocks of the full model and the `train_*` files.
 
 Let's take `attention_forward.cpp` as an example. The following will compile the attention forward pass kernel for Intel's hardware:
 
 ```shell
-cd sycl/
+cd dev/sycl/
 make attention_forward
 ```
 
