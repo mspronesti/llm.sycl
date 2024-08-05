@@ -3,9 +3,25 @@ name: GPU Train and Test
 on: [push, pull_request]
 
 jobs:
+  diff:
+    runs-on: ubuntu-latest
+    outputs:
+      train_test_changed: ${{ steps.filter.outputs.train_test_changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            train_test_changed:
+              - 'train_*'
+              - 'test_*'
+
   train-and-test-gpu:
+    needs: diff
     runs-on: devcloud # self-hosted GPU runner on Intel devcloud
 
+    if: needs.diff.outputs.train_test_changed == 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

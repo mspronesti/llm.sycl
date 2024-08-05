@@ -3,11 +3,26 @@ name: CI kernels
 on: [push, pull_request]
 
 jobs:
+  diff:
+    runs-on: ubuntu-latest
+    outputs:
+      sycl_changed: ${{ steps.filter.outputs.sycl_changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            sycl_changed:
+              - 'dev/sycl/**'
+
   gpu:
+    needs: diff
     runs-on: devcloud # self-hosted GPU runner on Intel devcloud
     name: Run all kernels (GPU)
+    if: needs.diff.outputs.sycl_changed == 'true'
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Build kernels (GPU)
         run:  |
@@ -20,10 +35,12 @@ jobs:
           make run_all CC=icx
 
   cpu:
+    needs: diff
     runs-on: ubuntu-latest
     name: Run all kernels (CPU)
+    if: needs.diff.outputs.sycl_changed == 'true'
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install OneAPI
         uses: rscohn2/setup-oneapi@v0
         with:
